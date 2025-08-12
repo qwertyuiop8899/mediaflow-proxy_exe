@@ -6,6 +6,13 @@
 
 MediaFlow Proxy is a powerful and flexible solution for proxifying various types of media streams. It supports HTTP(S) links, HLS (M3U8) streams, and MPEG-DASH streams, including DRM-protected content. This proxy can convert MPEG-DASH DRM-protected streams to decrypted HLS live streams in real-time, making it one of the fastest live decrypter servers available.
 
+## Exe version
+
+Per utilizzare la versione EXE, andare su Actions, cliccare BuildlauncheEXE. 
+in basso sotto Artifacts cliccare e scaricare mediaflow-exe, scompattare lo zip e leggere il readme.
+Oppure clicare sul bat e si aprira un terminale, li avrete l'url per raggiungere MFP, password mfp.
+
+
 ## Features
 
 ### Stream Processing
