@@ -44,8 +44,8 @@ def validate_config() -> Tuple[int, bool]:
     api_pw = os.getenv("API_PASSWORD")
     if not api_pw:
         print("⚠️ WARNING: API_PASSWORD is not set!")
-    elif api_pw == "changeme":
-        print("⚠️ WARNING: You are using the default API password 'changeme'!")
+    elif api_pw == "mfp":
+        print("⚠️ WARNING: You are using the default API password 'mfp'!")
 
     debug = parse_bool(os.getenv("DEBUG"), default=False)
     if debug:
