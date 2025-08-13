@@ -10,7 +10,8 @@ MediaFlow Proxy is a powerful and flexible solution for proxifying various types
 
 Per utilizzare la versione EXE, andare su Actions, cliccare BuildlauncheEXE. 
 in basso sotto Artifacts cliccare e scaricare mediaflow-exe, scompattare lo zip e leggere il readme.
-Oppure clicare sul bat e si aprira un terminale, li avrete l'url per raggiungere MFP, password mfp.
+accedwre alla pagina 127.0.0.1:8888 oppure vostroip, pubblico privato :8888 la password mfp.
+
 
 
 ## Features
