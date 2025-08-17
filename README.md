@@ -9,8 +9,12 @@ MediaFlow Proxy is a powerful and flexible solution for proxifying various types
 ## Exe version
 
 Per utilizzare la versione EXE, andare su Actions, cliccare BuildlauncheEXE. 
-in basso sotto Artifacts cliccare e scaricare mediaflow-exe, scompattare lo zip e leggere il readme.
-accedwre alla pagina 127.0.0.1:8888 oppure vostroip, pubblico privato :8888 la password mfp.
+in basso sotto Artifacts cliccare e scaricare mediaflow-exe, scompattare lo zip.
+accedere alla pagina 127.0.0.1:8888 oppure vostro ip, pubblico privato con aggiunta di :8888
+la password è mfp
+
+Per usarlo negli addon, inserire http://127.0.0.1:8888 quando viene richiesto url MFP e mfp come password
+
 
 
 
