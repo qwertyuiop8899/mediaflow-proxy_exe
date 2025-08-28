@@ -1,346 +1,54 @@
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>TvVoo Addon | ElfHosted</title>
-  <style>
-    body {
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      margin: 0;
-    padding: 2rem;
-      /* Background image with translucent overlay for readability */
-      background:
-        linear-gradient(rgba(13,17,23,0.84), rgba(13,17,23,0.84)),
-        url('https://raw.githubusercontent.com/qwertyuiop8899/tvvoo/refs/heads/main/public/tvvoo.png') center / cover no-repeat fixed;
-      color:#c9d1d9;
-      min-height: 100vh;
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    }
-  .card { max-width: 1000px; width: 100%; background: rgba(22,27,34,0.35); border:1px solid rgba(48,54,61,0.4); border-radius:12px; padding:24px; backdrop-filter: blur(2px); animation: 2s ease 0s infinite normal none running pulse; }
-  h1 { margin-top:0; font-size: 3rem; line-height: 1.1; display:flex; align-items:center; gap:12px; }
-  .title-icon { height: 1em; width: auto; object-fit: contain; }
-  .byline { font-size: 1.2rem; opacity: 0.9; }
-    .url { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; background:#0b1220; padding:8px 12px; border-radius:8px; display:inline-block; }
-    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
-    .grid { display:grid; grid-template-columns: repeat(auto-fill,minmax(140px,1fr)); gap:8px; margin: 12px 0; }
-  .flag { display:flex; align-items:center; justify-content:center; gap:8px; border:1px solid #4b2a7c; background: rgba(42,10,59,0.72); padding:10px; height:54px; border-radius:10px; cursor:pointer; }
-  .flag:hover { border-color:#6a3eb8; background: rgba(52,16,79,0.78); }
-  .flag img { width: 20px; height: 14px; object-fit: cover; border-radius:2px; box-shadow: 0 0 0 1px rgba(0,0,0,.2); }
-    .flag input { margin:0; }
-  a.btn, button.btn { display:inline-block; margin-top:16px; background:#238636; color:white; text-decoration:none; padding:10px 16px; border-radius:8px; border:none; cursor:pointer; transition: background .2s ease, border-color .2s ease; }
-    a.btn:hover { background:#2ea043; }
-    button.btn:hover { background:#2ea043; }
-  /* Disabled state */
-  .btn.disabled, .btn[disabled] { opacity: .5; cursor: not-allowed; pointer-events: none; }
-  /* Copied state: purple like the tiles */
-  .btn.copied { background:#2a0a3b !important; border:1px solid #6a3eb8 !important; }
-  footer { margin-top:24px; font-size: 12px; opacity: .7; }
-  /* Support styles for the ElfHosted banner */
-  .full-width { width: 100%; box-sizing: border-box; }
-  @keyframes pulse {
-  0% { box-shadow: 0 0 0 0 rgba(140, 82, 255, 0.3); }
-  70% { box-shadow: 0 0 0 12px rgba(140, 82, 255, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(140, 82, 255, 0); }
-  }
-  #privateInstanceFeatures.collapsed { display: none; }
-  .toggle-btn .toggle-icon { transition: transform 0.3s ease; }
-  .toggle-btn[aria-expanded="true"] .toggle-icon { transform: rotate(180deg); }
-  </style>
-</head>
-<body>
-  <div class="card">
-  <!-- ElfHosted info section -->
-  <div id="elfhostedInfoSection" class="full-width" style="background: linear-gradient(135deg, rgba(140, 82, 255, 0.15), rgba(0, 163, 255, 0.15)); border-radius: 0.6rem; padding: 1rem; margin: 1rem 0px; border: 1px solid rgba(140, 82, 255, 0.3); animation: 2s ease 0s infinite normal none running pulse; display: block;">
-          <p style="font-size: 1rem; text-align: center; margin-bottom: 0.5rem; color: #fff;">
-            <span style="font-weight: 600; color: #8c52ff;"> NEW HOSTING PARTNER </span>
-          </p>
-          <p style="text-align: center; margin-bottom: 0.75rem;">
-            Hosting infrastructure donated by <a href="https://elfhosted.com/" target="_blank" style="color: #00c16e; font-weight: 600; text-decoration: none;">ElfHosted</a> ❤️, and
-            independently maintained by <a href="https://hayd.uk" target="_blank" style="color: #00a3ff; font-weight: 600; text-decoration: none;">Hayduk</a>. See the <a href="https://stremio-addons-guide.elfhosted.com/" target="_blank" style="color: #00a3ff; font-weight: 600; text-decoration: none;">ElfHosted Stremio Addons
-              Guide</a> for more addons, or grab <a href="https://store.elfhosted.com/tvvoo" target="_blank" style="color: #00c16e; font-weight: 600; text-decoration: none;">your own isolated, private
-              instance</a> (<i>directly supports your developer!</i>)
-          </p>
+import os
+import sys
+from dotenv import load_dotenv
 
-          <!-- Toggle button for private instance features -->
-          <div style="text-align: center; margin-bottom: 0.5rem;">
-            <button id="togglePrivateFeatures" class="toggle-btn" style="display: inline-flex; align-items: center; background-color: rgba(140, 82, 255, 0.2); border-radius: 0.4rem; padding: 0.4rem 0.8rem; border: 1px solid rgba(140, 82, 255, 0.4); cursor: pointer;">
-              <span class="toggle-icon" style="margin-right: 0.5rem; transition: transform 0.3s ease;">▼</span>
-              <span style="font-weight: 500; color: #8c52ff;">View Private Instance Features</span>
-            </button>
-          </div>
+# ✅ Determine base path whether running as EXE or .py
+base_path = os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__)
 
-          <!-- Collapsible features section -->
-          <div id="privateInstanceFeatures" class="cookie-config collapsed" style="background: rgba(15, 15, 15, 0.5); margin-top: 0.5rem;">
-            <div style="padding: 0.75rem;">
-              <h3 style="font-size: 0.95rem; margin-bottom: 0.75rem; color: #fff; text-align: center;">
-                ElfHosted Private Instance Information</h3>
+# ✅ Load .env next to EXE or script
+dotenv_path = os.path.join(base_path, ".env")
+if os.path.exists(dotenv_path):
+    load_dotenv(dotenv_path)
+else:
+    print("⚠️ No .env file found")
 
-              <ul style="list-style-type: none; padding: 0; margin: 0;">
-                <li style="display: flex; align-items: flex-start; margin-bottom: 0.6rem;">
-                  <span style="color: #00c16e; margin-right: 0.5rem;">•</span>
-                  <span style="font-size: 0.85rem; color: #fff;">Private instance with separate
-                    rate-limits</span>
-                </li>
-                <li style="display: flex; align-items: flex-start; margin-bottom: 0.6rem;">
-                  <span style="color: #00c16e; margin-right: 0.5rem;">•</span>
-                  <span style="font-size: 0.85rem; color: #fff;">Faster link fetching</span>
-                </li>
-                <li style="display: flex; align-items: flex-start; margin-bottom: 0.6rem;">
-                  <span style="color: #00c16e; margin-right: 0.5rem;">•</span>
-                  <span style="font-size: 0.85rem; color: #fff;">No Token Expiration - Zero Buffer or Freeze</span>
-                </li>
-                <li style="display: flex; align-items: flex-start; margin-bottom: 0;">
-                  <span style="color: #00c16e; margin-right: 0.5rem;">•</span>
-                  <span style="font-size: 0.85rem; color: #fff;">33% of hosting fees go to addon
-                    development</span>
-                </li>
-              </ul>
+# ✅ Set fallback values
+os.environ.setdefault("API_PASSWORD", "changeme")
 
-              <div style="margin-top: 1rem; background: rgba(10, 10, 10, 0.4); border-radius: 0.5rem; padding: 0.75rem; border: 1px dashed rgba(140, 82, 255, 0.3);">
-                <p style="font-size: 0.85rem; color: #fff; margin: 0; text-align: center;">
-                  Hosted by ElfHosted with free trial available
-                </p>
-              </div>
+# ✅ Optional: Show API_PASSWORD if DEBUG=true
+if os.getenv("DEBUG", "false").lower() == "true":
+    print(f"🔐 API_PASSWORD: {os.getenv('API_PASSWORD')}")
 
-              <div style="text-align: center; margin-top: 1rem;">
-                <a href="https://store.elfhosted.com/product/tvvoo" target="_blank" style="display: inline-block; padding: 0.5rem 1rem; background: rgba(140, 82, 255, 0.2); color: #8c52ff; font-weight: 500; font-size: 0.85rem; border-radius: 0.5rem; text-decoration: none; border: 1px solid rgba(140, 82, 255, 0.4);">View
-                  on ElfHosted</a>
-              </div>
-            </div>
-          </div>
-        </div>
+# ✅ Import the FastAPI app AFTER env setup
+from mediaflow_proxy.main import app
 
-  <h1>
-    <span>TvVoo | ElfHosted</span>
-    <img class="title-icon" alt="icon" src="https://raw.githubusercontent.com/qwertyuiop8899/StreamViX/refs/heads/main/public/icon.png" />
-  <span class="byline">By PrisonMike For PR (Logos and Categories) <a href="https://github.com/qwertyuiop8899/tvvoo" target="_blank" rel="noopener noreferrer">GitHub</a></span>
-  </h1>
-  <p class="byline">Version:<strong id="ver">…</strong></p>
-  <p>Stremio addon for Vavoo: TV channels by country. Without MediaFlowProxy the token will last 30-60 min, reload the channel if needed</p>
-  <h3>Included countries</h3>
-    <div class="grid" id="flags"></div>
-    <div class="row">
-      <button class="btn" id="clear-all">Clear</button>
-    </div>
-    <p>Manifest URL:</p>
-    <div class="url" id="murl"></div>
-    <div class="row">
-      <button class="btn" id="copy">Copy</button>
-    </div>
-    <div class="row">
-      <a class="btn" id="install">Install in Stremio</a>
-    </div>
-    <div class="row" style="justify-content: flex-end; margin-top: 6px;">
-      <span id="mfStatus" style="display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:999px; border:1px solid rgba(140,82,255,0.35); background: rgba(22,27,34,0.45); color:#c9d1d9; font-size: 0.9rem;">
-        <span style="opacity:.85;">MediaFlow Proxy:</span>
-        <strong id="mfState">OFF</strong>
-        <span id="mfIcon">🏠</span>
-      </span>
-    </div>
-    <hr style="margin: 16px 0; border: 0; border-top: 1px solid rgba(140, 82, 255, 0.25);" />
-    <div class="row" style="gap: 0; align-items: stretch;">
-      <div style="flex: 0 1 46%; min-width: 200px; margin-right: 20px;">
-        <label for="proxyUrl" style="display:block; font-size: 0.9rem; margin-bottom: 4px;">MediaFlow URL</label>
-        <input id="proxyUrl" type="text" style="width:100%; padding:8px; border-radius:6px; border:1px solid rgba(140,82,255,0.3); background:#0b1220; color:#c9d1d9;" />
-      </div>
-      <div style="flex: 0 1 46%; min-width: 160px; margin-left: 20px;">
-        <label for="proxyPsw" style="display:block; font-size: 0.9rem; margin-bottom: 4px;">MediaFlow PSW</label>
-        <input id="proxyPsw" type="password" style="width:100%; padding:8px; border-radius:6px; border:1px solid rgba(140,82,255,0.3); background:#0b1220; color:#c9d1d9;" />
-      </div>
-    </div>
-    
-    <footer>
-      <p>If the link doesn’t open the app, copy and paste the Manifest URL into Stremio.</p>
-    </footer>
-  </div>
-  <script>
-    // Toggle for ElfHosted private features
-    (function(){
-      const toggleBtn = document.getElementById('togglePrivateFeatures');
-      const features = document.getElementById('privateInstanceFeatures');
-      if (toggleBtn && features) {
-        // ensure initial collapsed state
-        features.classList.add('collapsed');
-        toggleBtn.setAttribute('aria-expanded', 'false');
-        toggleBtn.addEventListener('click', () => {
-          const isCollapsed = features.classList.toggle('collapsed');
-          toggleBtn.setAttribute('aria-expanded', String(!isCollapsed));
-        });
-      }
-    })();
+def run():
+    import uvicorn
 
-    const COUNTRIES = [
-  { id: 'it', name: 'Italy' },
-      { id: 'uk', name: 'United Kingdom' },
-      { id: 'fr', name: 'France' },
-      { id: 'de', name: 'Germany' },
-      { id: 'pt', name: 'Portugal' },
-      { id: 'es', name: 'Spain' },
-  { id: 'al', name: 'Albania' },
-      { id: 'tr', name: 'Turkey' },
-  { id: 'nl', name: 'Netherlands' },
-  { id: 'ar', name: 'Arabic' },
-      { id: 'bk', name: 'Balkans' },
-      { id: 'ru', name: 'Russia' },
-      { id: 'ro', name: 'Romania' },
-      { id: 'pl', name: 'Poland' },
-      { id: 'bg', name: 'Bulgaria' },
-    ];
-    // Map each id to a flag image URL (absolute). For UK use GB. For Arabic/Balkans use regional substitutes.
-    const FLAG_URLS = {
-      it: 'https://flagcdn.com/w20/it.png',
-      uk: 'https://flagcdn.com/w20/gb.png',
-      fr: 'https://flagcdn.com/w20/fr.png',
-      de: 'https://flagcdn.com/w20/de.png',
-      pt: 'https://flagcdn.com/w20/pt.png',
-      es: 'https://flagcdn.com/w20/es.png',
-      al: 'https://flagcdn.com/w20/al.png',
-      tr: 'https://flagcdn.com/w20/tr.png',
-      nl: 'https://flagcdn.com/w20/nl.png',
-      ar: 'https://flagcdn.com/w20/sa.png',
-  bk: 'https://flagcdn.com/w20/eu.png',
-  ru: 'https://flagcdn.com/w20/ru.png',
-  ro: 'https://flagcdn.com/w20/ro.png',
-  pl: 'https://flagcdn.com/w20/pl.png',
-  bg: 'https://flagcdn.com/w20/bg.png'
-    };
-    const flags = document.getElementById('flags');
-    COUNTRIES.forEach(c => {
-      const div = document.createElement('label');
-      div.className = 'flag';
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.value = c.id;
-      cb.checked = false; // default: all disabled
-      // No selection limit: just update on change
-      cb.addEventListener('change', () => {
-        update();
-      });
-      div.appendChild(cb);
-      const img = document.createElement('img');
-      img.src = FLAG_URLS[c.id] || '';
-      img.alt = c.id;
-      div.appendChild(img);
-      const span = document.createElement('span');
-      span.textContent = `${c.name}`;
-      div.appendChild(span);
-      flags.appendChild(div);
-    });
+    # Check if running as frozen EXE
+    is_frozen = getattr(sys, 'frozen', False)
 
-    const clearAll = document.getElementById('clear-all');
-  if (clearAll) {
-    clearAll.onclick = () => { document.querySelectorAll('#flags input').forEach(e => e.checked = false); update(); };
-  }
+    # Try to load HTTPS certs from the same folder
+    cert_file = os.path.join(base_path, "cert.pem")
+    key_file = os.path.join(base_path, "key.pem")
 
-    function buildUrl() {
-      const chosen = Array.from(document.querySelectorAll('#flags input'))
-        .filter(e => e.checked)
-        .map(e => e.value)
-        .join(',');
-      if (!chosen) return `${location.origin}/manifest.json`;
-      // Safe path-based: /cfg-it-uk-fr/manifest.json
-      const parts = chosen.split(',').map(s => s.trim()).filter(Boolean);
-      let safe = parts.join('-');
-      // Append proxy params into path segments if provided (base64url-safe)
-  const normUrl = (s) => s.trim().replace(/\/+$/, '');
-  const pUrl = normUrl(document.getElementById('proxyUrl').value || '');
-      const pPsw = document.getElementById('proxyPsw').value.trim();
-      if (pUrl && pPsw) {
-        const b64url = (s) => {
-          try {
-            const b64 = btoa(unescape(encodeURIComponent(s)));
-            return b64.replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_');
-          } catch { return ''; }
-        };
-        const encUrl = b64url(pUrl);
-        const encPsw = b64url(pPsw);
-        if (encUrl && encPsw) safe = `${safe}-mfu_${encUrl}-mfp_${encPsw}`;
-      }
-      return `${location.origin}/cfg-${safe}/manifest.json`;
-    }
+    ssl_args = {}
+    if os.path.exists(cert_file) and os.path.exists(key_file):
+        ssl_args["ssl_certfile"] = cert_file
+        ssl_args["ssl_keyfile"] = key_file
+        print("🔐 HTTPS enabled (cert.pem + key.pem)")
+    else:
+        print("⚠️ HTTPS certs not found, running on plain HTTP")
 
-    function update() {
-      const m = buildUrl();
-      document.getElementById('murl').textContent = m;
-  // Build proper stremio protocol link without leading https://
-  const clean = m.replace(/^https?:\/\//i, '');
-      const install = document.getElementById('install');
-      const copyBtnEl = document.getElementById('copy');
-      // Enable/disable actions based on selection
-      const anySelected = Array.from(document.querySelectorAll('#flags input')).some(e => e.checked);
-      if (anySelected) {
-        install.classList.remove('disabled');
-        install.setAttribute('href', 'stremio://' + clean);
-        install.setAttribute('aria-disabled', 'false');
-        copyBtnEl.classList.remove('disabled');
-        copyBtnEl.removeAttribute('disabled');
-      } else {
-        install.classList.add('disabled');
-        install.removeAttribute('href');
-        install.setAttribute('aria-disabled', 'true');
-        copyBtnEl.classList.add('disabled');
-        copyBtnEl.setAttribute('disabled', 'true');
-      }
-  // Button label remains static; toggle controls hdr=1 query param
-      // Update MediaFlow status badge
-  const normUrl = (s) => s.trim().replace(/\/+$/, '');
-  const pUrl = normUrl(document.getElementById('proxyUrl').value || '');
-      const pPsw = document.getElementById('proxyPsw').value.trim();
-      const on = !!(pUrl && pPsw);
-      const mfState = document.getElementById('mfState');
-      const mfIcon = document.getElementById('mfIcon');
-      const badge = document.getElementById('mfStatus');
-      if (on) {
-        mfState.textContent = 'ON';
-        mfIcon.textContent = '🛰️';
-        badge.style.borderColor = 'rgba(0, 193, 110, 0.6)';
-        badge.style.background = 'rgba(0, 193, 110, 0.12)';
-        badge.style.color = '#a7ffd9';
-      } else {
-        mfState.textContent = 'OFF';
-        mfIcon.textContent = '🏠';
-        badge.style.borderColor = 'rgba(140,82,255,0.35)';
-        badge.style.background = 'rgba(22,27,34,0.45)';
-        badge.style.color = '#c9d1d9';
-      }
-    }
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8888,
+        reload=not is_frozen,
+        workers=1,
+        log_level="info",
+        **ssl_args
+    )
 
-    const copyBtn = document.getElementById('copy');
-    copyBtn.onclick = async () => {
-      if (copyBtn.hasAttribute('disabled')) return;
-      const urlText = document.getElementById('murl').textContent;
-      const prevText = copyBtn.textContent;
-      try {
-        await navigator.clipboard.writeText(urlText);
-        copyBtn.classList.add('copied');
-        copyBtn.textContent = 'Copied!';
-        setTimeout(() => {
-          copyBtn.classList.remove('copied');
-          copyBtn.textContent = prevText;
-        }, 1600);
-      } catch (e) {
-        copyBtn.textContent = 'Copy failed';
-        setTimeout(() => { copyBtn.textContent = prevText; }, 1400);
-      }
-    };
-
-  // Recompute when inputs change
-  document.getElementById('proxyUrl').addEventListener('input', update);
-  document.getElementById('proxyPsw').addEventListener('input', update);
-  update();
-  // Load manifest version from server (keeps in sync with addon.ts)
-  (async function loadVersion(){
-    try {
-      const res = await fetch('/manifest.json', { cache: 'no-store' });
-      if (!res.ok) return;
-      const j = await res.json();
-      const el = document.getElementById('ver');
-      if (el && j && typeof j.version === 'string') el.textContent = j.version;
-    } catch {}
-  })();
-  </script>
-</body>
-</html>
+if __name__ == "__main__":
+    run()
