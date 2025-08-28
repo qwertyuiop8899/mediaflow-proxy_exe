@@ -29,9 +29,11 @@ jobs:
         run: |
           poetry config virtualenvs.create false
           poetry install --no-dev
+
       - name: 🧾 Auto-generate .env
         run: |
           echo API_PASSWORD=${{ secrets.API_PASSWORD != '' && secrets.API_PASSWORD || 'changeme' }} > .env
+
       - name: 🧊 Install PyInstaller
         run: pip install pyinstaller
 
@@ -44,6 +46,7 @@ jobs:
             --name mediaflow `
             --add-data "mediaflow_proxy/static;mediaflow_proxy/static" `
             --add-data ".env;."
+
           # If cert.pem and key.pem exist, rebuild including them
           if ((Test-Path "cert.pem") -and (Test-Path "key.pem")) {
             echo "🔐 Adding cert.pem and key.pem to EXE"
@@ -57,6 +60,7 @@ jobs:
           } else {
             echo "⚠️ cert.pem or key.pem missing - building HTTP-only"
           }
+
       - name: 📦 Upload artifact
         uses: actions/upload-artifact@v4
         with:
