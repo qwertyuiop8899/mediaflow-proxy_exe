@@ -1,7 +1,9 @@
 ﻿# MediaFlow Proxy
 
 ## EXE download
-
+andare in https://github.com/qwertyuiop8899/mediaflow-proxy_exe/actions e cliccare sulla run verde piu in alto.
+Entrare e cliccare su mediaflow_exe in basso. scaricare e avviare l exe, si avviera il server.
+da quel momento in poi provare 0.0.0.0:8888 o 127.0.0.0:8888, utilizzare ip del pc (ipconfig da terminale) con :8888 negli addon che necessitano di mediaflow proxy.
 
 <div style="text-align: center;">
   <img src="https://cdn.githubraw.com/mhdzumair/mediaflow-proxy/main/mediaflow_proxy/static/logo.png" alt="MediaFlow Proxy Logo" width="200" style="border-radius: 15px;">
