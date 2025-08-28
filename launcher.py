@@ -13,7 +13,7 @@ else:
     print("⚠️ No .env file found")
 
 # ✅ Set fallback values
-os.environ.setdefault("API_PASSWORD", "changeme")
+os.environ.setdefault("API_PASSWORD", "mfp")
 
 # ✅ Optional: Show API_PASSWORD if DEBUG=true
 if os.getenv("DEBUG", "false").lower() == "true":
