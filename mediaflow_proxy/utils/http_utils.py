@@ -1,703 +1,389 @@
-import logging
-import typing
 import asyncio
-from dataclasses import dataclass
-from functools import partial
-from urllib import parse
-from urllib.parse import urlencode
-
-import anyio
-import h11
+import logging
+import psutil
+from typing import Dict, Optional, List
+from urllib.parse import urlparse
 import httpx
-import tenacity
-from fastapi import Response
-from starlette.background import BackgroundTask
-from starlette.concurrency import iterate_in_threadpool
-from starlette.requests import Request
-from starlette.types import Receive, Send, Scope
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, wait_fixed
-from tqdm.asyncio import tqdm as tqdm_asyncio
-
+from mediaflow_proxy.utils.http_utils import create_httpx_client, get_shared_httpx_client, fetch_hls_segment_fast
 from mediaflow_proxy.configs import settings
-from mediaflow_proxy.const import SUPPORTED_REQUEST_HEADERS
-from mediaflow_proxy.utils.crypto_utils import EncryptionHandler
 
 logger = logging.getLogger(__name__)
 
 
-class DownloadError(Exception):
-    def __init__(self, status_code, message):
-        self.status_code = status_code
-        self.message = message
-        super().__init__(message)
-
-
-_shared_client: httpx.AsyncClient | None = None
-_shared_client_lock = asyncio.Lock()
-
-
-def create_httpx_client(follow_redirects: bool = True, **kwargs) -> httpx.AsyncClient:
-    """Creates an HTTPX client with configured proxy routing (non-shared)."""
-    mounts = settings.transport_config.get_mounts()
-    kwargs.setdefault("timeout", settings.transport_config.timeout)
-    return httpx.AsyncClient(mounts=mounts, follow_redirects=follow_redirects, **kwargs)
-
-
-async def get_shared_httpx_client() -> httpx.AsyncClient:
-    """Return a process-wide shared AsyncClient to benefit from connection pooling for live segment fetches."""
-    global _shared_client
-    if _shared_client and not _shared_client.is_closed:
-        return _shared_client
-    async with _shared_client_lock:
-        if _shared_client is None or _shared_client.is_closed:
-            _shared_client = create_httpx_client()
-            logger.info("Created new shared httpx.AsyncClient")
-    return _shared_client
-
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type(DownloadError),
-)
-async def fetch_with_retry(client, method, url, headers, follow_redirects=True, **kwargs):
+class HLSPreBuffer:
     """
-    Fetches a URL with retry logic.
-
-    Args:
-        client (httpx.AsyncClient): The HTTP client to use for the request.
-        method (str): The HTTP method to use (e.g., GET, POST).
-        url (str): The URL to fetch.
-        headers (dict): The headers to include in the request.
-        follow_redirects (bool, optional): Whether to follow redirects. Defaults to True.
-        **kwargs: Additional arguments to pass to the request.
-
-    Returns:
-        httpx.Response: The HTTP response.
-
-    Raises:
-        DownloadError: If the request fails after retries.
+    Pre-buffer system for HLS streams to reduce latency and improve streaming performance.
     """
-    try:
-        response = await client.request(method, url, headers=headers, follow_redirects=follow_redirects, **kwargs)
-        response.raise_for_status()
-        return response
-    except httpx.TimeoutException:
-        logger.warning(f"Timeout while downloading {url}")
-        raise DownloadError(409, f"Timeout while downloading {url}")
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error {e.response.status_code} while downloading {url}")
-        if e.response.status_code == 404:
-            logger.error(f"Segment Resource not found: {url}")
-            raise e
-        raise DownloadError(e.response.status_code, f"HTTP error {e.response.status_code} while downloading {url}")
-    except Exception as e:
-        logger.error(f"Error downloading {url}: {e}")
-        raise
-
-
-class Streamer:
-    def __init__(self, client):
+    
+    def __init__(self, max_cache_size: Optional[int] = None, prebuffer_segments: Optional[int] = None):
         """
-        Initializes the Streamer with an HTTP client.
-
+        Initialize the HLS pre-buffer system.
+        
         Args:
-            client (httpx.AsyncClient): The HTTP client to use for streaming.
+            max_cache_size (int): Maximum number of segments to cache (uses config if None)
+            prebuffer_segments (int): Number of segments to pre-buffer ahead (uses config if None)
         """
-        self.client = client
-        self.response = None
-        self.progress_bar = None
-        self.bytes_transferred = 0
-        self.start_byte = 0
-        self.end_byte = 0
-        self.total_size = 0
-
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type(DownloadError),
-    )
-    async def create_streaming_response(self, url: str, headers: dict):
+        self.max_cache_size = max_cache_size or settings.hls_prebuffer_cache_size
+        self.prebuffer_segments = prebuffer_segments or settings.hls_prebuffer_segments
+        self.max_memory_percent = settings.hls_prebuffer_max_memory_percent
+        self.emergency_threshold = settings.hls_prebuffer_emergency_threshold
+        self.segment_cache: Dict[str, bytes] = {}
+        self.segment_urls: Dict[str, List[str]] = {}
+        self.client = create_httpx_client()  # fallback client (non-shared)
+        self._semaphore = asyncio.Semaphore(settings.hls_prebuffer_max_concurrency)
+        
+    async def prebuffer_playlist(self, playlist_url: str, headers: Dict[str, str]) -> None:
         """
-        Creates and sends a streaming request.
-
+        Pre-buffer segments from an HLS playlist.
+        
         Args:
-            url (str): The URL to stream from.
-            headers (dict): The headers to include in the request.
-
+            playlist_url (str): URL of the HLS playlist
+            headers (Dict[str, str]): Headers to use for requests
         """
         try:
-            request = self.client.build_request("GET", url, headers=headers)
-            self.response = await self.client.send(request, stream=True, follow_redirects=True)
-            self.response.raise_for_status()
-        except httpx.TimeoutException:
-            logger.warning("Timeout while creating streaming response")
-            raise DownloadError(409, "Timeout while creating streaming response")
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error {e.response.status_code} while creating streaming response")
-            if e.response.status_code == 404:
-                logger.error(f"Segment Resource not found: {url}")
-                raise e
-            raise DownloadError(
-                e.response.status_code, f"HTTP error {e.response.status_code} while creating streaming response"
-            )
-        except httpx.RequestError as e:
-            logger.error(f"Error creating streaming response: {e}")
-            raise DownloadError(502, f"Error creating streaming response: {e}")
-        except Exception as e:
-            logger.error(f"Error creating streaming response: {e}")
-            raise RuntimeError(f"Error creating streaming response: {e}")
-
-    async def stream_content(self) -> typing.AsyncGenerator[bytes, None]:
-        """
-        Streams the content from the response.
-        """
-        if not self.response:
-            raise RuntimeError("No response available for streaming")
-
-        try:
-            self.parse_content_range()
-
-            if settings.enable_streaming_progress:
-                with tqdm_asyncio(
-                    total=self.total_size,
-                    initial=self.start_byte,
-                    unit="B",
-                    unit_scale=True,
-                    unit_divisor=1024,
-                    desc="Streaming",
-                    ncols=100,
-                    mininterval=1,
-                ) as self.progress_bar:
-                    async for chunk in self.response.aiter_bytes():
-                        yield chunk
-                        chunk_size = len(chunk)
-                        self.bytes_transferred += chunk_size
-                        self.progress_bar.set_postfix_str(
-                            f"📥 : {self.format_bytes(self.bytes_transferred)}", refresh=False
-                        )
-                        self.progress_bar.update(chunk_size)
-            else:
-                async for chunk in self.response.aiter_bytes():
-                    yield chunk
-                    self.bytes_transferred += len(chunk)
-
-        except httpx.TimeoutException:
-            logger.warning("Timeout while streaming")
-            raise DownloadError(409, "Timeout while streaming")
-        except httpx.RemoteProtocolError as e:
-            # Special handling for connection closed errors
-            if "peer closed connection without sending complete message body" in str(e):
-                logger.warning(f"Remote server closed connection prematurely: {e}")
-                # If we've received some data, just log the warning and return normally
-                if self.bytes_transferred > 0:
-                    logger.info(
-                        f"Partial content received ({self.bytes_transferred} bytes). Continuing with available data."
-                    )
-                    return
+            logger.debug(f"Starting pre-buffer for playlist: {playlist_url}")
+            
+            # Download and parse playlist
+            # Use shared client for manifest as well
+            shared_client = await get_shared_httpx_client()
+            response = await shared_client.get(playlist_url, headers=headers)
+            response.raise_for_status()
+            playlist_content = response.text
+            
+            # Check if this is a master playlist (contains variants)
+            if "#EXT-X-STREAM-INF" in playlist_content:
+                logger.debug(f"Master playlist detected, finding first variant")
+                # Extract variant URLs
+                variant_urls = self._extract_variant_urls(playlist_content, playlist_url)
+                if variant_urls:
+                    # Pre-buffer the first variant
+                    first_variant_url = variant_urls[0]
+                    logger.debug(f"Pre-buffering first variant: {first_variant_url}")
+                    await self.prebuffer_playlist(first_variant_url, headers)
                 else:
-                    # If we haven't received any data, raise an error
-                    raise DownloadError(502, f"Remote server closed connection without sending any data: {e}")
-            else:
-                logger.error(f"Protocol error while streaming: {e}")
-                raise DownloadError(502, f"Protocol error while streaming: {e}")
-        except GeneratorExit:
-            logger.info("Streaming session stopped by the user")
+                    logger.warning("No variants found in master playlist")
+                return
+            
+            # Extract segment URLs
+            segment_urls = self._extract_segment_urls(playlist_content, playlist_url)
+            
+            # Store segment URLs for this playlist
+            self.segment_urls[playlist_url] = segment_urls
+            
+            # Pre-buffer first few segments
+            await self._prebuffer_segments(segment_urls[:self.prebuffer_segments], headers)
+            
+            logger.info(f"Pre-buffered {min(self.prebuffer_segments, len(segment_urls))} segments for {playlist_url}")
+            
         except Exception as e:
-            logger.error(f"Error streaming content: {e}")
-            raise
-
-    @staticmethod
-    def format_bytes(size) -> str:
-        power = 2**10
-        n = 0
-        units = {0: "B", 1: "KB", 2: "MB", 3: "GB", 4: "TB"}
-        while size > power:
-            size /= power
-            n += 1
-        return f"{size:.2f} {units[n]}"
-
-    def parse_content_range(self):
-        content_range = self.response.headers.get("Content-Range", "")
-        if content_range:
-            range_info = content_range.split()[-1]
-            self.start_byte, self.end_byte, self.total_size = map(int, range_info.replace("/", "-").split("-"))
-        else:
-            self.start_byte = 0
-            self.total_size = int(self.response.headers.get("Content-Length", 0))
-            self.end_byte = self.total_size - 1 if self.total_size > 0 else 0
-
-    async def get_text(self, url: str, headers: dict):
+            logger.warning(f"Failed to pre-buffer playlist {playlist_url}: {e}")
+    
+    def _extract_segment_urls(self, playlist_content: str, base_url: str) -> List[str]:
         """
-        Sends a GET request to a URL and returns the response text.
-
+        Extract segment URLs from HLS playlist content.
+        
         Args:
-            url (str): The URL to send the GET request to.
-            headers (dict): The headers to include in the request.
-
+            playlist_content (str): Content of the HLS playlist
+            base_url (str): Base URL for resolving relative URLs
+            
         Returns:
-            str: The response text.
+            List[str]: List of segment URLs
         """
-        try:
-            self.response = await fetch_with_retry(self.client, "GET", url, headers)
-        except tenacity.RetryError as e:
-            raise e.last_attempt.result()
-        return self.response.text
+        segment_urls = []
+        candidate_static: List[str] = []
+        lines = playlist_content.split('\n')
+        
+        logger.debug(f"Analyzing playlist with {len(lines)} lines")
+        
+        # Heuristics:
+        # 1. Only treat a URI line as media segment if the previous directive is #EXTINF or #EXT-X-BYTERANGE
+        # 2. Skip obvious non-media/static asset extensions (images, css, js, svg, json, avif, webp, ico)
+        # 3. Allow typical media extensions (.ts, .m4s, .aac, .vtt, .mp3, .m4a)
+        allowed_ext = {'.ts', '.m4s', '.aac', '.vtt', '.mp3', '.m4a', '.cmf'}
+        skip_ext = {'.jpg', '.jpeg', '.png', '.gif', '.svg', '.css', '.js', '.avif', '.webp', '.json', '.ico'}
 
-    async def close(self):
-        """
-        Closes the HTTP client and response.
-        """
-        if self.response:
-            await self.response.aclose()
-        if self.progress_bar:
-            self.progress_bar.close()
-        # Only close client if it's not the shared global client
-        try:
-            global _shared_client
-            if self.client is not _shared_client:
-                await self.client.aclose()
+        prev_line = ''
+        skipped_non_media = 0
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                prev_line = line
+                continue
+            if line.startswith('#'):
+                prev_line = line
+                continue
+
+            # Determine extension (lowercase) from path portion (strip query)
+            path_part = line.split('?', 1)[0]
+            dot_idx = path_part.rfind('.')
+            ext = path_part[dot_idx:].lower() if dot_idx != -1 else ''
+
+            # If extension clearly a static asset -> skip
+            if ext in skip_ext:
+                # Keep as candidate in case playlist disguises segments with image/js extensions
+                candidate_static.append(line)
+                skipped_non_media += 1
+                prev_line = line
+                continue
+
+            # If extension not in allowed list, require EXTINF/ BYTERANGE context to consider
+            context_required = ext not in allowed_ext
+            if context_required and not (prev_line.startswith('#EXTINF') or prev_line.startswith('#EXT-X-BYTERANGE')):
+                candidate_static.append(line)
+                skipped_non_media += 1
+                prev_line = line
+                continue
+
+            # Accept line. Resolve relative if needed
+            if line.startswith('http://') or line.startswith('https://'):
+                segment_urls.append(line)
+                logger.debug(f"Found segment URL: {line}")
             else:
-                logger.debug("Not closing shared httpx.AsyncClient (pooled)")
-        except Exception:
-            pass
-
-
-async def download_file_with_retry(url: str, headers: dict):
-    """
-    Downloads a file with retry logic.
-
-    Args:
-        url (str): The URL of the file to download.
-        headers (dict): The headers to include in the request.
-
-    Returns:
-        bytes: The downloaded file content.
-
-    Raises:
-        DownloadError: If the download fails after retries.
-    """
-    # Use shared client for better pooling
-    client = await get_shared_httpx_client()
-    try:
-        response = await fetch_with_retry(client, "GET", url, headers)
-        return response.content
-    except DownloadError as e:
-        logger.error(f"Failed to download file: {e}")
-        raise e
-    except tenacity.RetryError as e:
-        raise DownloadError(502, f"Failed to download file: {e.last_attempt.result()}")
-
-
-async def request_with_retry(method: str, url: str, headers: dict, **kwargs) -> httpx.Response:
-    """
-    Sends an HTTP request with retry logic.
-
-    Args:
-        method (str): The HTTP method to use (e.g., GET, POST).
-        url (str): The URL to send the request to.
-        headers (dict): The headers to include in the request.
-        **kwargs: Additional arguments to pass to the request.
-
-    Returns:
-        httpx.Response: The HTTP response.
-
-    Raises:
-        DownloadError: If the request fails after retries.
-    """
-    client = await get_shared_httpx_client()
-    try:
-        response = await fetch_with_retry(client, method, url, headers, **kwargs)
-        return response
-    except DownloadError as e:
-        logger.error(f"Failed to download file: {e}")
-        raise
-
-
-# Fast segment fetch (low latency live optimization)
-class FastSegmentError(Exception):
-    pass
-
-
-_FAST_RETRY_ATTEMPTS = max(1, getattr(settings, 'segment_fast_retry_attempts', 1))
-_FAST_RETRY_WAIT_SECS = max(0.0, getattr(settings, 'segment_fast_retry_wait_ms', 250) / 1000.0)
-
-@retry(
-    stop=stop_after_attempt(_FAST_RETRY_ATTEMPTS),
-    wait=wait_fixed(_FAST_RETRY_WAIT_SECS),
-    retry=retry_if_exception_type(FastSegmentError),
-)
-async def fetch_hls_segment_fast(url: str, headers: dict) -> bytes:
-    """Fetch a single HLS segment quickly with low timeouts and small retry delays.
-
-    Raises FastSegmentError to trigger retry. Other exceptions propagate.
-    """
-    client = await get_shared_httpx_client()
-    timeout = httpx.Timeout(
-        connect=settings.segment_fast_timeout_connect,
-        read=settings.segment_fast_timeout_read,
-        write=settings.segment_fast_timeout_connect,
-        pool=settings.segment_fast_timeout_pool,
-    )
-    try:
-        resp = await client.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        return resp.content
-    except httpx.TimeoutException as e:
-        logger.warning(f"Fast segment timeout {url}: {e}")
-        raise FastSegmentError(str(e))
-    except httpx.HTTPStatusError as e:
-        # Retry only 5xx
-        if 500 <= e.response.status_code < 600:
-            logger.warning(f"Fast segment HTTP {e.response.status_code} {url}")
-            raise FastSegmentError(str(e))
-        raise
-
-
-def encode_mediaflow_proxy_url(
-    mediaflow_proxy_url: str,
-    endpoint: typing.Optional[str] = None,
-    destination_url: typing.Optional[str] = None,
-    query_params: typing.Optional[dict] = None,
-    request_headers: typing.Optional[dict] = None,
-    response_headers: typing.Optional[dict] = None,
-    encryption_handler: EncryptionHandler = None,
-    expiration: int = None,
-    ip: str = None,
-    filename: typing.Optional[str] = None,
-) -> str:
-    """
-    Encodes & Encrypt (Optional) a MediaFlow proxy URL with query parameters and headers.
-
-    Args:
-        mediaflow_proxy_url (str): The base MediaFlow proxy URL.
-        endpoint (str, optional): The endpoint to append to the base URL. Defaults to None.
-        destination_url (str, optional): The destination URL to include in the query parameters. Defaults to None.
-        query_params (dict, optional): Additional query parameters to include. Defaults to None.
-        request_headers (dict, optional): Headers to include as query parameters. Defaults to None.
-        response_headers (dict, optional): Headers to include as query parameters. Defaults to None.
-        encryption_handler (EncryptionHandler, optional): The encryption handler to use. Defaults to None.
-        expiration (int, optional): The expiration time for the encrypted token. Defaults to None.
-        ip (str, optional): The public IP address to include in the query parameters. Defaults to None.
-        filename (str, optional): Filename to be preserved for media players like Infuse. Defaults to None.
-
-    Returns:
-        str: The encoded MediaFlow proxy URL.
-    """
-    # Prepare query parameters
-    query_params = query_params or {}
-    if destination_url is not None:
-        query_params["d"] = destination_url
-
-    # Add headers if provided
-    if request_headers:
-        query_params.update(
-            {key if key.startswith("h_") else f"h_{key}": value for key, value in request_headers.items()}
-        )
-    if response_headers:
-        query_params.update(
-            {key if key.startswith("r_") else f"r_{key}": value for key, value in response_headers.items()}
-        )
-
-    # Construct the base URL
-    if endpoint is None:
-        base_url = mediaflow_proxy_url
-    else:
-        base_url = parse.urljoin(mediaflow_proxy_url, endpoint)
-
-    # Ensure base_url doesn't end with a slash for consistent handling
-    if base_url.endswith("/"):
-        base_url = base_url[:-1]
-
-    # Handle encryption if needed
-    if encryption_handler:
-        encrypted_token = encryption_handler.encrypt_data(query_params, expiration, ip)
-
-        # Parse the base URL to get its components
-        parsed_url = parse.urlparse(base_url)
-
-        # Insert the token at the beginning of the path
-        new_path = f"/_token_{encrypted_token}{parsed_url.path}"
-
-        # Reconstruct the URL with the token at the beginning of the path
-        url_parts = list(parsed_url)
-        url_parts[2] = new_path  # Update the path component
-
-        # Build the URL
-        url = parse.urlunparse(url_parts)
-
-        # Add filename at the end if provided
-        if filename:
-            url = f"{url}/{parse.quote(filename)}"
-
-        return url
-    else:
-        # No encryption, use regular query parameters
-        url = base_url
-        if filename:
-            url = f"{url}/{parse.quote(filename)}"
-
-        if query_params:
-            return f"{url}?{urlencode(query_params)}"
-        return url
-
-
-def encode_stremio_proxy_url(
-    stremio_proxy_url: str,
-    destination_url: str,
-    request_headers: typing.Optional[dict] = None,
-    response_headers: typing.Optional[dict] = None,
-) -> str:
-    """
-    Encodes a Stremio proxy URL with destination URL and headers.
-
-    Format: http://127.0.0.1:11470/proxy/d=<encoded_origin>&h=<headers>&r=<response_headers>/<path><query>
-
-    Args:
-        stremio_proxy_url (str): The base Stremio proxy URL.
-        destination_url (str): The destination URL to proxy.
-        request_headers (dict, optional): Headers to include as query parameters. Defaults to None.
-        response_headers (dict, optional): Response headers to include as query parameters. Defaults to None.
-
-    Returns:
-        str: The encoded Stremio proxy URL.
-    """
-    # Parse the destination URL to separate origin, path, and query
-    parsed_dest = parse.urlparse(destination_url)
-    dest_origin = f"{parsed_dest.scheme}://{parsed_dest.netloc}"
-    dest_path = parsed_dest.path.lstrip("/")
-    dest_query = parsed_dest.query
-
-    # Prepare query parameters list for proper handling of multiple headers
-    query_parts = []
-
-    # Add destination origin (scheme + netloc only) with proper encoding
-    query_parts.append(f"d={parse.quote_plus(dest_origin)}")
-
-    # Add request headers
-    if request_headers:
-        for key, value in request_headers.items():
-            header_string = f"{key}:{value}"
-            query_parts.append(f"h={parse.quote_plus(header_string)}")
-
-    # Add response headers
-    if response_headers:
-        for key, value in response_headers.items():
-            header_string = f"{key}:{value}"
-            query_parts.append(f"r={parse.quote_plus(header_string)}")
-
-    # Ensure base_url doesn't end with a slash for consistent handling
-    base_url = stremio_proxy_url.rstrip("/")
-
-    # Construct the URL path with query string
-    query_string = "&".join(query_parts)
-
-    # Build the final URL: /proxy/{opts}/{pathname}{search}
-    url_path = f"/proxy/{query_string}"
-
-    # Append the path from destination URL
-    if dest_path:
-        url_path = f"{url_path}/{dest_path}"
-
-    # Append the query string from destination URL
-    if dest_query:
-        url_path = f"{url_path}?{dest_query}"
-
-    return f"{base_url}{url_path}"
-
-
-def get_original_scheme(request: Request) -> str:
-    """
-    Determines the original scheme (http or https) of the request.
-
-    Args:
-        request (Request): The incoming HTTP request.
-
-    Returns:
-        str: The original scheme ('http' or 'https')
-    """
-    # Check the X-Forwarded-Proto header first
-    forwarded_proto = request.headers.get("X-Forwarded-Proto")
-    if forwarded_proto:
-        return forwarded_proto
-
-    # Check if the request is secure
-    if request.url.scheme == "https" or request.headers.get("X-Forwarded-Ssl") == "on":
-        return "https"
-
-    # Check for other common headers that might indicate HTTPS
-    if (
-        request.headers.get("X-Forwarded-Ssl") == "on"
-        or request.headers.get("X-Forwarded-Protocol") == "https"
-        or request.headers.get("X-Url-Scheme") == "https"
-    ):
-        return "https"
-
-    # Default to http if no indicators of https are found
-    return "http"
-
-
-@dataclass
-class ProxyRequestHeaders:
-    request: dict
-    response: dict
-
-
-def get_proxy_headers(request: Request) -> ProxyRequestHeaders:
-    """
-    Extracts proxy headers from the request query parameters.
-
-    Args:
-        request (Request): The incoming HTTP request.
-
-    Returns:
-        ProxyRequest: A named tuple containing the request headers and response headers.
-    """
-    request_headers = {k: v for k, v in request.headers.items() if k in SUPPORTED_REQUEST_HEADERS}
-    request_headers.update({k[2:].lower(): v for k, v in request.query_params.items() if k.startswith("h_")})
-    response_headers = {k[2:].lower(): v for k, v in request.query_params.items() if k.startswith("r_")}
-    return ProxyRequestHeaders(request_headers, response_headers)
-
-
-class EnhancedStreamingResponse(Response):
-    body_iterator: typing.AsyncIterable[typing.Any]
-
-    def __init__(
-        self,
-        content: typing.Union[typing.AsyncIterable[typing.Any], typing.Iterable[typing.Any]],
-        status_code: int = 200,
-        headers: typing.Optional[typing.Mapping[str, str]] = None,
-        media_type: typing.Optional[str] = None,
-        background: typing.Optional[BackgroundTask] = None,
-    ) -> None:
-        if isinstance(content, typing.AsyncIterable):
-            self.body_iterator = content
-        else:
-            self.body_iterator = iterate_in_threadpool(content)
-        self.status_code = status_code
-        self.media_type = self.media_type if media_type is None else media_type
-        self.background = background
-        self.init_headers(headers)
-        self.actual_content_length = 0
-
-    @staticmethod
-    async def listen_for_disconnect(receive: Receive) -> None:
-        try:
-            while True:
-                message = await receive()
-                if message["type"] == "http.disconnect":
-                    logger.debug("Client disconnected")
-                    break
-        except Exception as e:
-            logger.error(f"Error in listen_for_disconnect: {str(e)}")
-
-    async def stream_response(self, send: Send) -> None:
-        try:
-            # Initialize headers
-            headers = list(self.raw_headers)
-
-            # Set the transfer-encoding to chunked for streamed responses with content-length
-            # when content-length is present. This ensures we don't hit protocol errors
-            # if the upstream connection is closed prematurely.
-            for i, (name, _) in enumerate(headers):
-                if name.lower() == b"content-length":
-                    # Replace content-length with transfer-encoding: chunked for streaming
-                    headers[i] = (b"transfer-encoding", b"chunked")
-                    headers = [h for h in headers if h[0].lower() != b"content-length"]
-                    logger.debug("Switched from content-length to chunked transfer-encoding for streaming")
-                    break
-
-            # Start the response
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": self.status_code,
-                    "headers": headers,
-                }
-            )
-
-            # Track if we've sent any data
-            data_sent = False
-
-            try:
-                async for chunk in self.body_iterator:
-                    if not isinstance(chunk, (bytes, memoryview)):
-                        chunk = chunk.encode(self.charset)
-                    try:
-                        await send({"type": "http.response.body", "body": chunk, "more_body": True})
-                        data_sent = True
-                        self.actual_content_length += len(chunk)
-                    except (ConnectionResetError, anyio.BrokenResourceError):
-                        logger.info("Client disconnected during streaming")
-                        return
-
-                # Successfully streamed all content
-                await send({"type": "http.response.body", "body": b"", "more_body": False})
-            except (httpx.RemoteProtocolError, h11._util.LocalProtocolError) as e:
-                # Handle connection closed errors
-                if data_sent:
-                    # We've sent some data to the client, so try to complete the response
-                    logger.warning(f"Remote protocol error after partial streaming: {e}")
-                    try:
-                        await send({"type": "http.response.body", "body": b"", "more_body": False})
-                        logger.info(
-                            f"Response finalized after partial content ({self.actual_content_length} bytes transferred)"
-                        )
-                    except Exception as close_err:
-                        logger.warning(f"Could not finalize response after remote error: {close_err}")
+                parsed_base = urlparse(base_url)
+                if line.startswith('/'):
+                    segment_url = f"{parsed_base.scheme}://{parsed_base.netloc}{line}"
                 else:
-                    # No data was sent, re-raise the error
-                    logger.error(f"Protocol error before any data was streamed: {e}")
-                    raise
+                    base_path = parsed_base.path.rsplit('/', 1)[0] if '/' in parsed_base.path else ''
+                    segment_url = f"{parsed_base.scheme}://{parsed_base.netloc}{base_path}/{line}"
+                segment_urls.append(segment_url)
+                logger.debug(f"Found relative segment: {line} -> {segment_url}")
+            prev_line = line
+
+        if skipped_non_media:
+            logger.debug(f"Skipped {skipped_non_media} non-media/static lines in playlist heuristics")
+
+        # Fallback: if we extracted zero segments but have static candidates, some providers disguise
+        # TS/MPEG chunks behind fake extensions (jpeg/png/js). In that case, use the candidates.
+        if not segment_urls and candidate_static:
+            logger.warning(
+                "No media segments detected by heuristics; falling back to treating static-looking URLs as segments (disguised mode)"
+            )
+            parsed_base = urlparse(base_url)
+            for cand in candidate_static:
+                if cand.startswith('http://') or cand.startswith('https://'):
+                    segment_urls.append(cand)
+                else:
+                    if cand.startswith('/'):
+                        seg_url = f"{parsed_base.scheme}://{parsed_base.netloc}{cand}"
+                    else:
+                        base_path = parsed_base.path.rsplit('/', 1)[0] if '/' in parsed_base.path else ''
+                        seg_url = f"{parsed_base.scheme}://{parsed_base.netloc}{base_path}/{cand}"
+                    segment_urls.append(seg_url)
+            logger.info(f"Disguised segment mode: using {len(segment_urls)} candidate URLs")
+        
+        logger.debug(f"Extracted {len(segment_urls)} segment URLs from playlist")
+        if segment_urls:
+            logger.debug(f"First segment URL: {segment_urls[0]}")
+        else:
+            logger.debug("No segment URLs found in playlist")
+            # Log first few lines for debugging
+            for i, line in enumerate(lines[:10]):
+                logger.debug(f"Line {i}: {line}")
+        
+        return segment_urls
+    
+    def _extract_variant_urls(self, playlist_content: str, base_url: str) -> List[str]:
+        """
+        Extract variant URLs from master playlist content.
+        
+        Args:
+            playlist_content (str): Content of the master playlist
+            base_url (str): Base URL for resolving relative URLs
+            
+        Returns:
+            List[str]: List of variant URLs
+        """
+        variant_urls = []
+        lines = playlist_content.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith('#') and ('http://' in line or 'https://' in line):
+                # Resolve relative URLs
+                if line.startswith('http'):
+                    variant_urls.append(line)
+                else:
+                    # Join with base URL for relative paths
+                    parsed_base = urlparse(base_url)
+                    variant_url = f"{parsed_base.scheme}://{parsed_base.netloc}{line}"
+                    variant_urls.append(variant_url)
+        
+        logger.debug(f"Extracted {len(variant_urls)} variant URLs from master playlist")
+        if variant_urls:
+            logger.debug(f"First variant URL: {variant_urls[0]}")
+        
+        return variant_urls
+    
+    async def _prebuffer_segments(self, segment_urls: List[str], headers: Dict[str, str]) -> None:
+        """
+        Pre-buffer specific segments.
+        
+        Args:
+            segment_urls (List[str]): List of segment URLs to pre-buffer
+            headers (Dict[str, str]): Headers to use for requests
+        """
+        tasks = [self._download_segment(url, headers) for url in segment_urls if url not in self.segment_cache]
+        if tasks:
+            # Limit concurrency with semaphore manually
+            async def runner(coro):
+                async with self._semaphore:
+                    return await coro
+            await asyncio.gather(*[runner(c) for c in tasks], return_exceptions=True)
+    
+    def _get_memory_usage_percent(self) -> float:
+        """
+        Get current memory usage percentage.
+        
+        Returns:
+            float: Memory usage percentage
+        """
+        try:
+            memory = psutil.virtual_memory()
+            return memory.percent
         except Exception as e:
-            logger.exception(f"Error in stream_response: {str(e)}")
-            if not isinstance(e, (ConnectionResetError, anyio.BrokenResourceError)):
-                try:
-                    # Try to send an error response if client is still connected
-                    await send(
-                        {
-                            "type": "http.response.start",
-                            "status": 502,
-                            "headers": [(b"content-type", b"text/plain")],
-                        }
-                    )
-                    error_message = f"Streaming error: {str(e)}".encode("utf-8")
-                    await send({"type": "http.response.body", "body": error_message, "more_body": False})
-                except Exception:
-                    # If we can't send an error response, just log it
-                    pass
+            logger.warning(f"Failed to get memory usage: {e}")
+            return 0.0
+    
+    def _check_memory_threshold(self) -> bool:
+        """
+        Check if memory usage exceeds the emergency threshold.
+        
+        Returns:
+            bool: True if emergency cleanup is needed
+        """
+        memory_percent = self._get_memory_usage_percent()
+        return memory_percent > self.emergency_threshold
+    
+    def _emergency_cache_cleanup(self) -> None:
+        """
+        Perform emergency cache cleanup when memory usage is high.
+        """
+        if self._check_memory_threshold():
+            logger.warning("Emergency cache cleanup triggered due to high memory usage")
+            # Clear 50% of cache
+            cache_size = len(self.segment_cache)
+            keys_to_remove = list(self.segment_cache.keys())[:cache_size // 2]
+            for key in keys_to_remove:
+                del self.segment_cache[key]
+            logger.info(f"Emergency cleanup removed {len(keys_to_remove)} segments from cache")
+    
+    async def _download_segment(self, segment_url: str, headers: Dict[str, str]) -> None:
+        """
+        Download a single segment and cache it.
+        
+        Args:
+            segment_url (str): URL of the segment to download
+            headers (Dict[str, str]): Headers to use for request
+        """
+        try:
+            # Check memory usage before downloading
+            memory_percent = self._get_memory_usage_percent()
+            if memory_percent > self.max_memory_percent:
+                logger.warning(f"Memory usage {memory_percent}% exceeds limit {self.max_memory_percent}%, skipping download")
+                return
+            
+            # Prefer fast fetch path
+            try:
+                content = await fetch_hls_segment_fast(segment_url, headers)
+            except Exception:
+                # Fallback normal client
+                response = await self.client.get(segment_url, headers=headers)
+                response.raise_for_status()
+                content = response.content
 
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        async with anyio.create_task_group() as task_group:
-            streaming_completed = False
-            stream_func = partial(self.stream_response, send)
-            listen_func = partial(self.listen_for_disconnect, receive)
+            self.segment_cache[segment_url] = content
+            
+            # Check for emergency cleanup
+            if self._check_memory_threshold():
+                self._emergency_cache_cleanup()
+            # Maintain cache size
+            elif len(self.segment_cache) > self.max_cache_size:
+                # Remove oldest entries (simple FIFO)
+                oldest_key = next(iter(self.segment_cache))
+                del self.segment_cache[oldest_key]
+                
+            logger.debug(f"Cached segment: {segment_url}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to download segment {segment_url}: {e}")
+    
+    async def get_segment(self, segment_url: str, headers: Dict[str, str]) -> Optional[bytes]:
+        """
+        Get a segment from cache or download it.
+        
+        Args:
+            segment_url (str): URL of the segment
+            headers (Dict[str, str]): Headers to use for request
+            
+        Returns:
+            Optional[bytes]: Cached segment data or None if not available
+        """
+        # Check cache first
+        if segment_url in self.segment_cache:
+            logger.debug(f"Cache hit for segment: {segment_url}")
+            return self.segment_cache[segment_url]
+        
+        # Check memory usage before downloading
+        memory_percent = self._get_memory_usage_percent()
+        if memory_percent > self.max_memory_percent:
+            logger.warning(f"Memory usage {memory_percent}% exceeds limit {self.max_memory_percent}%, skipping download")
+            return None
+        
+        # Download if not in cache
+        try:
+            try:
+                segment_data = await fetch_hls_segment_fast(segment_url, headers)
+            except Exception:
+                response = await self.client.get(segment_url, headers=headers)
+                response.raise_for_status()
+                segment_data = response.content
+            
+            # Cache the segment
+            self.segment_cache[segment_url] = segment_data
+            
+            # Check for emergency cleanup
+            if self._check_memory_threshold():
+                self._emergency_cache_cleanup()
+            # Maintain cache size
+            elif len(self.segment_cache) > self.max_cache_size:
+                oldest_key = next(iter(self.segment_cache))
+                del self.segment_cache[oldest_key]
+            
+            logger.debug(f"Downloaded and cached segment: {segment_url}")
+            return segment_data
+            
+        except Exception as e:
+            logger.warning(f"Failed to get segment {segment_url}: {e}")
+            return None
+    
+    async def prebuffer_next_segments(self, playlist_url: str, current_segment_index: int, headers: Dict[str, str]) -> None:
+        """
+        Pre-buffer next segments based on current playback position.
+        
+        Args:
+            playlist_url (str): URL of the playlist
+            current_segment_index (int): Index of current segment
+            headers (Dict[str, str]): Headers to use for requests
+        """
+        if playlist_url not in self.segment_urls:
+            return
+        
+        segment_urls = self.segment_urls[playlist_url]
+        next_segments = segment_urls[current_segment_index + 1:current_segment_index + 1 + self.prebuffer_segments]
+        
+        if next_segments:
+            await self._prebuffer_segments(next_segments, headers)
+    
+    def clear_cache(self) -> None:
+        """Clear the segment cache."""
+        self.segment_cache.clear()
+        self.segment_urls.clear()
+        logger.info("HLS pre-buffer cache cleared")
+    
+    async def close(self) -> None:
+        """Close the pre-buffer system."""
+        await self.client.aclose()
 
-            async def wrap(func: typing.Callable[[], typing.Awaitable[None]]) -> None:
-                try:
-                    await func()
-                    # If this is the stream_response function and it completes successfully, mark as done
-                    if func == stream_func:
-                        nonlocal streaming_completed
-                        streaming_completed = True
-                except Exception as e:
-                    if isinstance(e, (httpx.RemoteProtocolError, h11._util.LocalProtocolError)):
-                        # Handle protocol errors more gracefully
-                        logger.warning(f"Protocol error during streaming: {e}")
-                    elif not isinstance(e, anyio.get_cancelled_exc_class()):
-                        logger.exception("Error in streaming task")
-                        # Only re-raise if it's not a protocol error or cancellation
-                        raise
-                finally:
-                    # Only cancel the task group if we're in disconnect listener or
-                    # if streaming_completed is True (meaning we finished normally)
-                    if func == listen_func or streaming_completed:
-                        task_group.cancel_scope.cancel()
 
-            # Start the streaming response in a separate task
-            task_group.start_soon(wrap, stream_func)
-            # Listen for disconnect events
-            await wrap(listen_func)
-
-        if self.background is not None:
-            await self.background()
+# Global pre-buffer instance
+hls_prebuffer = HLSPreBuffer() 
