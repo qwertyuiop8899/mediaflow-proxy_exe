@@ -78,6 +78,7 @@ class Settings(BaseSettings):
     hls_prebuffer_max_memory_percent: int = 80  # Maximum percentage of system memory to use for HLS pre-buffer cache.
     hls_prebuffer_emergency_threshold: int = 90  # Emergency threshold percentage to trigger aggressive cache cleanup.
     hls_prebuffer_max_concurrency: int = 4  # Max concurrent segment downloads during prebuffer.
+    hls_prebuffer_allow_disguised: bool = False  # Allow fallback treating static-looking URLs as disguised segments.
     enable_dash_prebuffer: bool = False  # Whether to enable DASH pre-buffering for improved streaming performance.
     dash_prebuffer_segments: int = 5  # Number of segments to pre-buffer ahead.
     dash_prebuffer_cache_size: int = 50  # Maximum number of segments to cache in memory.
