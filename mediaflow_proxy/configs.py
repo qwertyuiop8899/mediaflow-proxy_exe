@@ -77,11 +77,19 @@ class Settings(BaseSettings):
     hls_prebuffer_cache_size: int = 50  # Maximum number of segments to cache in memory.
     hls_prebuffer_max_memory_percent: int = 80  # Maximum percentage of system memory to use for HLS pre-buffer cache.
     hls_prebuffer_emergency_threshold: int = 90  # Emergency threshold percentage to trigger aggressive cache cleanup.
+    hls_prebuffer_max_concurrency: int = 4  # Max concurrent segment downloads during prebuffer.
     enable_dash_prebuffer: bool = False  # Whether to enable DASH pre-buffering for improved streaming performance.
     dash_prebuffer_segments: int = 5  # Number of segments to pre-buffer ahead.
     dash_prebuffer_cache_size: int = 50  # Maximum number of segments to cache in memory.
     dash_prebuffer_max_memory_percent: int = 80  # Maximum percentage of system memory to use for DASH pre-buffer cache.
     dash_prebuffer_emergency_threshold: int = 90  # Emergency threshold percentage to trigger aggressive cache cleanup.
+
+    # Fast segment fetch tuning (live streaming optimization)
+    segment_fast_retry_attempts: int = 2  # Attempts for fast segment retry
+    segment_fast_retry_wait_ms: int = 250  # Wait between retries (ms)
+    segment_fast_timeout_read: float = 3.0  # Read timeout seconds for individual HLS segments
+    segment_fast_timeout_connect: float = 5.0  # Connect timeout seconds
+    segment_fast_timeout_pool: float = 5.0  # Pool acquisition timeout
 
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"  # The user agent to use for HTTP requests.
