@@ -90,6 +90,7 @@ class HLSPreBuffer:
             List[str]: List of segment URLs
         """
         segment_urls = []
+        candidate_static: List[str] = []
         lines = playlist_content.split('\n')
         
         logger.debug(f"Analyzing playlist with {len(lines)} lines")
@@ -119,6 +120,8 @@ class HLSPreBuffer:
 
             # If extension clearly a static asset -> skip
             if ext in skip_ext:
+                # Keep as candidate in case playlist disguises segments with image/js extensions
+                candidate_static.append(line)
                 skipped_non_media += 1
                 prev_line = line
                 continue
@@ -126,6 +129,7 @@ class HLSPreBuffer:
             # If extension not in allowed list, require EXTINF/ BYTERANGE context to consider
             context_required = ext not in allowed_ext
             if context_required and not (prev_line.startswith('#EXTINF') or prev_line.startswith('#EXT-X-BYTERANGE')):
+                candidate_static.append(line)
                 skipped_non_media += 1
                 prev_line = line
                 continue
@@ -147,6 +151,25 @@ class HLSPreBuffer:
 
         if skipped_non_media:
             logger.debug(f"Skipped {skipped_non_media} non-media/static lines in playlist heuristics")
+
+        # Fallback: if we extracted zero segments but have static candidates, some providers disguise
+        # TS/MPEG chunks behind fake extensions (jpeg/png/js). In that case, use the candidates.
+        if not segment_urls and candidate_static:
+            logger.warning(
+                "No media segments detected by heuristics; falling back to treating static-looking URLs as segments (disguised mode)"
+            )
+            parsed_base = urlparse(base_url)
+            for cand in candidate_static:
+                if cand.startswith('http://') or cand.startswith('https://'):
+                    segment_urls.append(cand)
+                else:
+                    if cand.startswith('/'):
+                        seg_url = f"{parsed_base.scheme}://{parsed_base.netloc}{cand}"
+                    else:
+                        base_path = parsed_base.path.rsplit('/', 1)[0] if '/' in parsed_base.path else ''
+                        seg_url = f"{parsed_base.scheme}://{parsed_base.netloc}{base_path}/{cand}"
+                    segment_urls.append(seg_url)
+            logger.info(f"Disguised segment mode: using {len(segment_urls)} candidate URLs")
         
         logger.debug(f"Extracted {len(segment_urls)} segment URLs from playlist")
         if segment_urls:
