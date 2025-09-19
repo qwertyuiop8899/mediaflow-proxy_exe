@@ -311,9 +311,12 @@ class FastSegmentError(Exception):
     pass
 
 
+_FAST_RETRY_ATTEMPTS = max(1, getattr(settings, 'segment_fast_retry_attempts', 1))
+_FAST_RETRY_WAIT_SECS = max(0.0, getattr(settings, 'segment_fast_retry_wait_ms', 250) / 1000.0)
+
 @retry(
-    stop=stop_after_attempt(lambda: settings.segment_fast_retry_attempts),
-    wait=wait_fixed(lambda: settings.segment_fast_retry_wait_ms / 1000.0),
+    stop=stop_after_attempt(_FAST_RETRY_ATTEMPTS),
+    wait=wait_fixed(_FAST_RETRY_WAIT_SECS),
     retry=retry_if_exception_type(FastSegmentError),
 )
 async def fetch_hls_segment_fast(url: str, headers: dict) -> bytes:
