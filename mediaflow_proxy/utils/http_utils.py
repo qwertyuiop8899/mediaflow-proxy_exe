@@ -252,7 +252,15 @@ class Streamer:
             await self.response.aclose()
         if self.progress_bar:
             self.progress_bar.close()
-        await self.client.aclose()
+        # Only close client if it's not the shared global client
+        try:
+            global _shared_client
+            if self.client is not _shared_client:
+                await self.client.aclose()
+            else:
+                logger.debug("Not closing shared httpx.AsyncClient (pooled)")
+        except Exception:
+            pass
 
 
 async def download_file_with_retry(url: str, headers: dict):
