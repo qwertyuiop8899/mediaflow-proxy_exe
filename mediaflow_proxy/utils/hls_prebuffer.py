@@ -4,7 +4,7 @@ import psutil
 from typing import Dict, Optional, List
 from urllib.parse import urlparse
 import httpx
-from mediaflow_proxy.utils.http_utils import create_httpx_client
+from mediaflow_proxy.utils.http_utils import create_httpx_client, get_shared_httpx_client, fetch_hls_segment_fast
 from mediaflow_proxy.configs import settings
 
 logger = logging.getLogger(__name__)
@@ -29,7 +29,8 @@ class HLSPreBuffer:
         self.emergency_threshold = settings.hls_prebuffer_emergency_threshold
         self.segment_cache: Dict[str, bytes] = {}
         self.segment_urls: Dict[str, List[str]] = {}
-        self.client = create_httpx_client()
+        self.client = create_httpx_client()  # fallback client (non-shared)
+        self._semaphore = asyncio.Semaphore(settings.hls_prebuffer_max_concurrency)
         
     async def prebuffer_playlist(self, playlist_url: str, headers: Dict[str, str]) -> None:
         """
@@ -43,7 +44,9 @@ class HLSPreBuffer:
             logger.debug(f"Starting pre-buffer for playlist: {playlist_url}")
             
             # Download and parse playlist
-            response = await self.client.get(playlist_url, headers=headers)
+            # Use shared client for manifest as well
+            shared_client = await get_shared_httpx_client()
+            response = await shared_client.get(playlist_url, headers=headers)
             response.raise_for_status()
             playlist_content = response.text
             
@@ -162,13 +165,13 @@ class HLSPreBuffer:
             segment_urls (List[str]): List of segment URLs to pre-buffer
             headers (Dict[str, str]): Headers to use for requests
         """
-        tasks = []
-        for url in segment_urls:
-            if url not in self.segment_cache:
-                tasks.append(self._download_segment(url, headers))
-        
+        tasks = [self._download_segment(url, headers) for url in segment_urls if url not in self.segment_cache]
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Limit concurrency with semaphore manually
+            async def runner(coro):
+                async with self._semaphore:
+                    return await coro
+            await asyncio.gather(*[runner(c) for c in tasks], return_exceptions=True)
     
     def _get_memory_usage_percent(self) -> float:
         """
@@ -222,11 +225,16 @@ class HLSPreBuffer:
                 logger.warning(f"Memory usage {memory_percent}% exceeds limit {self.max_memory_percent}%, skipping download")
                 return
             
-            response = await self.client.get(segment_url, headers=headers)
-            response.raise_for_status()
-            
-            # Cache the segment
-            self.segment_cache[segment_url] = response.content
+            # Prefer fast fetch path
+            try:
+                content = await fetch_hls_segment_fast(segment_url, headers)
+            except Exception:
+                # Fallback normal client
+                response = await self.client.get(segment_url, headers=headers)
+                response.raise_for_status()
+                content = response.content
+
+            self.segment_cache[segment_url] = content
             
             # Check for emergency cleanup
             if self._check_memory_threshold():
@@ -266,9 +274,12 @@ class HLSPreBuffer:
         
         # Download if not in cache
         try:
-            response = await self.client.get(segment_url, headers=headers)
-            response.raise_for_status()
-            segment_data = response.content
+            try:
+                segment_data = await fetch_hls_segment_fast(segment_url, headers)
+            except Exception:
+                response = await self.client.get(segment_url, headers=headers)
+                response.raise_for_status()
+                segment_data = response.content
             
             # Cache the segment
             self.segment_cache[segment_url] = segment_data
