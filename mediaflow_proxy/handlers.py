@@ -19,6 +19,7 @@ from .utils.http_utils import (
     EnhancedStreamingResponse,
     ProxyRequestHeaders,
     create_httpx_client,
+    get_shared_httpx_client,
 )
 from .utils.m3u8_processor import M3U8Processor
 from .utils.mpd_utils import pad_base64
@@ -33,7 +34,8 @@ async def setup_client_and_streamer() -> tuple[httpx.AsyncClient, Streamer]:
     Returns:
         tuple: An httpx.AsyncClient instance and a Streamer instance.
     """
-    client = create_httpx_client()
+    # Prefer shared client for pooling (fallback to new if closed)
+    client = await get_shared_httpx_client()
     return client, Streamer(client)
 
 
