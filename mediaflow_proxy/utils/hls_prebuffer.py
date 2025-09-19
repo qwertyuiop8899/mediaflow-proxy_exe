@@ -94,25 +94,59 @@ class HLSPreBuffer:
         
         logger.debug(f"Analyzing playlist with {len(lines)} lines")
         
-        for line in lines:
-            line = line.strip()
-            if line and not line.startswith('#'):
-                # Check if line contains a URL (http/https) or is a relative path
-                if 'http://' in line or 'https://' in line:
-                    segment_urls.append(line)
-                    logger.debug(f"Found absolute URL: {line}")
-                elif line and not line.startswith('#'):
-                    # This might be a relative path to a segment
-                    parsed_base = urlparse(base_url)
-                    # Ensure proper path joining
-                    if line.startswith('/'):
-                        segment_url = f"{parsed_base.scheme}://{parsed_base.netloc}{line}"
-                    else:
-                        # Get the directory path from base_url
-                        base_path = parsed_base.path.rsplit('/', 1)[0] if '/' in parsed_base.path else ''
-                        segment_url = f"{parsed_base.scheme}://{parsed_base.netloc}{base_path}/{line}"
-                    segment_urls.append(segment_url)
-                    logger.debug(f"Found relative path: {line} -> {segment_url}")
+        # Heuristics:
+        # 1. Only treat a URI line as media segment if the previous directive is #EXTINF or #EXT-X-BYTERANGE
+        # 2. Skip obvious non-media/static asset extensions (images, css, js, svg, json, avif, webp, ico)
+        # 3. Allow typical media extensions (.ts, .m4s, .aac, .vtt, .mp3, .m4a)
+        allowed_ext = {'.ts', '.m4s', '.aac', '.vtt', '.mp3', '.m4a', '.cmf'}
+        skip_ext = {'.jpg', '.jpeg', '.png', '.gif', '.svg', '.css', '.js', '.avif', '.webp', '.json', '.ico'}
+
+        prev_line = ''
+        skipped_non_media = 0
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                prev_line = line
+                continue
+            if line.startswith('#'):
+                prev_line = line
+                continue
+
+            # Determine extension (lowercase) from path portion (strip query)
+            path_part = line.split('?', 1)[0]
+            dot_idx = path_part.rfind('.')
+            ext = path_part[dot_idx:].lower() if dot_idx != -1 else ''
+
+            # If extension clearly a static asset -> skip
+            if ext in skip_ext:
+                skipped_non_media += 1
+                prev_line = line
+                continue
+
+            # If extension not in allowed list, require EXTINF/ BYTERANGE context to consider
+            context_required = ext not in allowed_ext
+            if context_required and not (prev_line.startswith('#EXTINF') or prev_line.startswith('#EXT-X-BYTERANGE')):
+                skipped_non_media += 1
+                prev_line = line
+                continue
+
+            # Accept line. Resolve relative if needed
+            if line.startswith('http://') or line.startswith('https://'):
+                segment_urls.append(line)
+                logger.debug(f"Found segment URL: {line}")
+            else:
+                parsed_base = urlparse(base_url)
+                if line.startswith('/'):
+                    segment_url = f"{parsed_base.scheme}://{parsed_base.netloc}{line}"
+                else:
+                    base_path = parsed_base.path.rsplit('/', 1)[0] if '/' in parsed_base.path else ''
+                    segment_url = f"{parsed_base.scheme}://{parsed_base.netloc}{base_path}/{line}"
+                segment_urls.append(segment_url)
+                logger.debug(f"Found relative segment: {line} -> {segment_url}")
+            prev_line = line
+
+        if skipped_non_media:
+            logger.debug(f"Skipped {skipped_non_media} non-media/static lines in playlist heuristics")
         
         logger.debug(f"Extracted {len(segment_urls)} segment URLs from playlist")
         if segment_urls:
