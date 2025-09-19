@@ -1,5 +1,6 @@
 import logging
 import typing
+import asyncio
 from dataclasses import dataclass
 from functools import partial
 from urllib import parse
@@ -14,7 +15,7 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import iterate_in_threadpool
 from starlette.requests import Request
 from starlette.types import Receive, Send, Scope
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, wait_fixed
 from tqdm.asyncio import tqdm as tqdm_asyncio
 
 from mediaflow_proxy.configs import settings
@@ -31,12 +32,27 @@ class DownloadError(Exception):
         super().__init__(message)
 
 
+_shared_client: httpx.AsyncClient | None = None
+_shared_client_lock = asyncio.Lock()
+
+
 def create_httpx_client(follow_redirects: bool = True, **kwargs) -> httpx.AsyncClient:
-    """Creates an HTTPX client with configured proxy routing"""
+    """Creates an HTTPX client with configured proxy routing (non-shared)."""
     mounts = settings.transport_config.get_mounts()
     kwargs.setdefault("timeout", settings.transport_config.timeout)
-    client = httpx.AsyncClient(mounts=mounts, follow_redirects=follow_redirects, **kwargs)
-    return client
+    return httpx.AsyncClient(mounts=mounts, follow_redirects=follow_redirects, **kwargs)
+
+
+async def get_shared_httpx_client() -> httpx.AsyncClient:
+    """Return a process-wide shared AsyncClient to benefit from connection pooling for live segment fetches."""
+    global _shared_client
+    if _shared_client and not _shared_client.is_closed:
+        return _shared_client
+    async with _shared_client_lock:
+        if _shared_client is None or _shared_client.is_closed:
+            _shared_client = create_httpx_client()
+            logger.info("Created new shared httpx.AsyncClient")
+    return _shared_client
 
 
 @retry(
@@ -253,15 +269,16 @@ async def download_file_with_retry(url: str, headers: dict):
     Raises:
         DownloadError: If the download fails after retries.
     """
-    async with create_httpx_client() as client:
-        try:
-            response = await fetch_with_retry(client, "GET", url, headers)
-            return response.content
-        except DownloadError as e:
-            logger.error(f"Failed to download file: {e}")
-            raise e
-        except tenacity.RetryError as e:
-            raise DownloadError(502, f"Failed to download file: {e.last_attempt.result()}")
+    # Use shared client for better pooling
+    client = await get_shared_httpx_client()
+    try:
+        response = await fetch_with_retry(client, "GET", url, headers)
+        return response.content
+    except DownloadError as e:
+        logger.error(f"Failed to download file: {e}")
+        raise e
+    except tenacity.RetryError as e:
+        raise DownloadError(502, f"Failed to download file: {e.last_attempt.result()}")
 
 
 async def request_with_retry(method: str, url: str, headers: dict, **kwargs) -> httpx.Response:
@@ -280,13 +297,50 @@ async def request_with_retry(method: str, url: str, headers: dict, **kwargs) -> 
     Raises:
         DownloadError: If the request fails after retries.
     """
-    async with create_httpx_client() as client:
-        try:
-            response = await fetch_with_retry(client, method, url, headers, **kwargs)
-            return response
-        except DownloadError as e:
-            logger.error(f"Failed to download file: {e}")
-            raise
+    client = await get_shared_httpx_client()
+    try:
+        response = await fetch_with_retry(client, method, url, headers, **kwargs)
+        return response
+    except DownloadError as e:
+        logger.error(f"Failed to download file: {e}")
+        raise
+
+
+# Fast segment fetch (low latency live optimization)
+class FastSegmentError(Exception):
+    pass
+
+
+@retry(
+    stop=stop_after_attempt(lambda: settings.segment_fast_retry_attempts),
+    wait=wait_fixed(lambda: settings.segment_fast_retry_wait_ms / 1000.0),
+    retry=retry_if_exception_type(FastSegmentError),
+)
+async def fetch_hls_segment_fast(url: str, headers: dict) -> bytes:
+    """Fetch a single HLS segment quickly with low timeouts and small retry delays.
+
+    Raises FastSegmentError to trigger retry. Other exceptions propagate.
+    """
+    client = await get_shared_httpx_client()
+    timeout = httpx.Timeout(
+        connect=settings.segment_fast_timeout_connect,
+        read=settings.segment_fast_timeout_read,
+        write=settings.segment_fast_timeout_connect,
+        pool=settings.segment_fast_timeout_pool,
+    )
+    try:
+        resp = await client.get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        return resp.content
+    except httpx.TimeoutException as e:
+        logger.warning(f"Fast segment timeout {url}: {e}")
+        raise FastSegmentError(str(e))
+    except httpx.HTTPStatusError as e:
+        # Retry only 5xx
+        if 500 <= e.response.status_code < 600:
+            logger.warning(f"Fast segment HTTP {e.response.status_code} {url}")
+            raise FastSegmentError(str(e))
+        raise
 
 
 def encode_mediaflow_proxy_url(
