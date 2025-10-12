@@ -171,20 +171,20 @@ class DLHDExtractor(BaseExtractor):
 
             # Try to extract parameters via JSON-like encoded XJZ or older patterns
             def extract_auth_params(js: str) -> Dict[str, Optional[str]]:
-                # NEW: Try XKZK/PWAROS format first
+                # NEW: Try IJXX/PWAROS format first
                 try:
-                    # Look for const XKZK = "..."
-                    xkzk_pattern = r'(?:const|var|let)\s+XKZK\s*=\s*["\']([^"\']+)["\']'
-                    xkzk_match = re.search(xkzk_pattern, js)
+                    # Look for const IJXX = "..."
+                    IJXX_pattern = r'(?:const|var|let)\s+IJXX\s*=\s*["\']([^"\']+)["\']'
+                    IJXX_match = re.search(IJXX_pattern, js)
                     
-                    if xkzk_match:
-                        b64_data = xkzk_match.group(1)
-                        logger.info(f"Found XKZK data: {b64_data[:50]}...")
+                    if IJXX_match:
+                        b64_data = IJXX_match.group(1)
+                        logger.info(f"Found IJXX data: {b64_data[:50]}...")
                         
                         import json
                         json_data = base64.b64decode(b64_data).decode('utf-8')
                         obj_data = json.loads(json_data)
-                        logger.info(f"Decoded XKZK object: {obj_data}")
+                        logger.info(f"Decoded IJXX object: {obj_data}")
                         
                         decoded_params = {}
                         for k, v in obj_data.items():
@@ -203,7 +203,7 @@ class DLHDExtractor(BaseExtractor):
                             "auth_sig": decoded_params.get('b_sig')
                         }
                 except Exception as e:
-                    logger.debug(f"Could not process XKZK format: {e}")
+                    logger.debug(f"Could not process IJXX format: {e}")
 
                 # FALLBACK: Try old XJZ format
                 try:
