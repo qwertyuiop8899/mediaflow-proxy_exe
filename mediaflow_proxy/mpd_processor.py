@@ -235,6 +235,19 @@ def build_hls_playlist(mpd_dict: dict, profiles: list[dict], request: Request) -
         query_params.pop("d", None)
         has_encrypted = query_params.pop("has_encrypted", False)
 
+        # Add #EXT-X-MAP tag for fMP4 initialization segment (only for first profile)
+        if index == 0:
+            map_query_params = query_params.copy()
+            map_query_params.update(
+                {"init_url": init_url, "segment_url": init_url, "mime_type": profile["mimeType"]}
+            )
+            map_url = encode_mediaflow_proxy_url(
+                proxy_url,
+                query_params=map_query_params,
+                encryption_handler=encryption_handler if has_encrypted else None,
+            )
+            hls.append(f'#EXT-X-MAP:URI="{map_url}"')
+
         for segment in segments:
             hls.append(f'#EXTINF:{segment["extinf"]:.3f},')
             query_params.update(
