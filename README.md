@@ -10,9 +10,11 @@ MediaFlow Proxy is a powerful and flexible solution for proxifying various types
 
 ### Stream Processing
 - Convert MPEG-DASH streams (DRM-protected and non-protected) to HLS
-- Support for Clear Key DRM-protected MPD DASH streams
+- **ClearKey DRM decryption** with support for all CENC encryption modes (see [DASH/MPD Support Status](#dashmpd-support-status))
+- Support for **multi-key DRM** streams (different keys for video/audio tracks)
 - Support for non-DRM protected DASH live and VOD streams
 - Proxy and modify HLS (M3U8) streams in real-time
+- **Smart pre-buffering** for both HLS and DASH streams (enabled by default)
 - Proxy HTTP/HTTPS links with custom headers
 
 ### Proxy & Routing
@@ -26,6 +28,20 @@ MediaFlow Proxy is a powerful and flexible solution for proxifying various types
 - Support for expired or self-signed SSL certificates
 - Public IP address retrieval for Debrid services integration
 
+### Xtream Codes (XC) API Proxy
+- **Stateless XC API proxy** for IPTV players
+- Support for live streams, VOD, series, and **catch-up/timeshift**
+- Compatible with any XC-compatible IPTV player (TiviMate, IPTV Smarters, etc.)
+- Automatic URL rewriting for seamless proxying
+
+### Acestream Proxy
+- **Acestream P2P stream proxy** - Proxy Acestream content through MediaFlow (inspired by [Acexy](https://github.com/Javinator9889/acexy))
+- Support for both **HLS manifest** and **MPEG-TS stream** output formats
+- **Stream multiplexing** - Multiple clients can watch the same stream simultaneously
+- Automatic **session management** with cross-process coordination
+- Works with content IDs (`acestream://...`) and infohashes (magnet links)
+- Compatible with any media player that supports HLS or MPEG-TS
+
 ### Security
 - API password protection against unauthorized access & Network bandwidth abuse prevention
 - Parameter encryption to hide sensitive information
@@ -35,10 +51,94 @@ MediaFlow Proxy is a powerful and flexible solution for proxifying various types
 ### Additional Features
 - Built-in speed test for RealDebrid and AllDebrid services
 - Custom header injection and modification
+- **Response header removal** - Remove problematic headers from upstream responses (e.g., incorrect Content-Length)
+- **Resolution selection** - Select specific resolution (e.g., 720p, 1080p) for HLS and DASH streams
 - Real-time HLS manifest manipulation
 - HLS Key URL modifications for bypassing stream restrictions
 - **Base64 URL Support** - Automatic detection and processing of base64 encoded URLs
+- **Segment Skipping** - Skip specific time ranges in HLS and DASH streams (intro/outro skipping, ad removal)
+- **Stream Transformers** - Handle host-specific stream obfuscation (e.g., PNG-wrapped MPEG-TS segments)
 
+### DASH/MPD Support Status
+
+#### MPD Segment Addressing Types
+
+| Type | Status | Notes |
+|------|--------|-------|
+| SegmentTemplate (fixed duration) | ✅ Supported | Most common for VOD content |
+| SegmentTemplate (SegmentTimeline) | ✅ Supported | Variable duration segments |
+| SegmentBase | ✅ Supported | Single file with byte ranges |
+| SegmentList | ✅ Supported | Explicit segment URLs in MPD |
+
+#### MPD Presentation Types
+
+| Type | Status | Notes |
+|------|--------|-------|
+| Static (VOD) | ✅ Supported | Fixed duration content |
+| Dynamic (Live) | ✅ Supported | Live streaming with availabilityStartTime |
+
+#### DRM/Encryption Support
+
+**Supported (ClearKey):**
+
+| Mode | Scheme | Status | Notes |
+|------|--------|--------|-------|
+| AES-CTR (cenc) | Full sample CTR | ✅ Supported | Standard CENC encryption |
+| AES-CTR Pattern (cens) | Subsample CTR | ✅ Supported | Pattern encryption with CTR |
+| AES-CBC (cbc1) | Full sample CBC | ✅ Supported | Full sample CBC mode |
+| AES-CBC Pattern (cbcs) | Subsample CBC | ✅ Supported | Used by Apple FairPlay |
+
+**Not Supported (Commercial DRM):**
+
+| DRM System | Status | Notes |
+|------------|--------|-------|
+| Widevine | ❌ Not Supported | Requires license server communication |
+| PlayReady | ❌ Not Supported | Microsoft's DRM system |
+| FairPlay | ❌ Not Supported | Apple's DRM system (keys not extractable) |
+| PrimeTime | ❌ Not Supported | Adobe's DRM system |
+
+> **Note**: MediaFlow Proxy only supports **ClearKey** DRM where the decryption keys are provided directly. Commercial DRM systems (Widevine, PlayReady, FairPlay) require license server communication and hardware-backed security that cannot be bypassed by this proxy.
+
+#### IV Size Support
+
+| Size | Status | Notes |
+|------|--------|-------|
+| 8-byte IV | ✅ Supported | GPAC default |
+| 16-byte IV | ✅ Supported | Bento4 default |
+| Constant IV | ✅ Supported | Used by CBCS streams |
+
+#### Multi-Key Support
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Single Key (all tracks) | ✅ Supported | Same key for video and audio |
+| Multi-Key (per track) | ✅ Supported | Different keys for video/audio tracks |
+| Key rotation | ❌ Not Supported | Keys changing mid-stream |
+
+### Pre-buffering (HLS & DASH)
+
+MediaFlow Proxy includes intelligent pre-buffering for both HLS and DASH streams, **enabled by default** to improve playback smoothness and reduce buffering.
+
+#### How Pre-buffering Works
+
+| Feature | HLS | DASH |
+|---------|-----|------|
+| Enabled by default | ✅ Yes | ✅ Yes |
+| Smart variant selection | ✅ Only buffers the variant being played | ✅ Only buffers requested profiles |
+| Live stream support | ✅ Buffers from end of playlist | ✅ Buffers from end of playlist |
+| VOD support | ✅ Buffers from start | ✅ Buffers from start |
+| Inactivity cleanup | ✅ Stops after 60s idle | ✅ Stops after 60s idle |
+| Memory management | ✅ Configurable limits | ✅ Configurable limits |
+
+#### Key Behaviors
+
+1. **Smart Variant Selection (HLS)**: When a master playlist is requested, pre-buffering does NOT automatically buffer all quality variants. It only starts buffering when the player actually requests segments from a specific variant, saving bandwidth and memory.
+
+2. **Inactivity Cleanup**: Both HLS and DASH pre-buffers automatically stop refreshing playlists and clean up resources after 60 seconds of inactivity (no segment requests). This prevents memory leaks when streams are stopped.
+
+3. **Live Stream Optimization**: For live streams, segments are buffered from the END of the playlist (most recent) rather than the beginning, ensuring the player has the freshest content available.
+
+4. **Memory Protection**: Pre-buffering respects configurable memory limits and will stop buffering if system memory usage exceeds thresholds.
 
 ## Configuration
 
@@ -50,19 +150,83 @@ Set the following environment variables:
 - `DISABLE_HOME_PAGE`: Optional. Disables the home page UI. Returns 403 for the root path and direct access to index.html. Default is `false`.
 - `DISABLE_DOCS`: Optional. Disables the API documentation (Swagger UI). Returns 403 for the /docs path. Default is `false`.
 - `DISABLE_SPEEDTEST`: Optional. Disables the speedtest UI. Returns 403 for the /speedtest path and direct access to speedtest.html. Default is `false`.
+- `CLEAR_CACHE_ON_STARTUP`: Optional. Clears all caches (extractor cache, etc.) when the server starts. Useful for development and testing. Default is `false`.
 - `STREMIO_PROXY_URL`: Optional. Stremio server URL for alternative content proxying. Example: `http://127.0.0.1:11470`.
 - `M3U8_CONTENT_ROUTING`: Optional. Routing strategy for M3U8 content URLs: `mediaflow` (default), `stremio`, or `direct`.
-- `ENABLE_HLS_PREBUFFER`: Optional. Enables HLS pre-buffering for improved streaming performance. Default: `false`. Enable this when you experience frequent buffering or want to improve playback smoothness for high-bitrate streams. Note that enabling pre-buffering increases memory usage and may not be suitable for low-memory environments.
+- `ENABLE_HLS_PREBUFFER`: Optional. Enables HLS pre-buffering for improved streaming performance. Default: `true`. Pre-buffering downloads upcoming segments ahead of playback to reduce buffering. Set to `false` to disable for low-memory environments.
 - `HLS_PREBUFFER_SEGMENTS`: Optional. Number of HLS segments to pre-buffer ahead. Default: `5`. Only effective when `ENABLE_HLS_PREBUFFER` is `true`.
 - `HLS_PREBUFFER_CACHE_SIZE`: Optional. Maximum number of HLS segments to keep in memory cache. Default: `50`. Only effective when `ENABLE_HLS_PREBUFFER` is `true`.
 - `HLS_PREBUFFER_MAX_MEMORY_PERCENT`: Optional. Maximum percentage of system memory to use for HLS pre-buffer cache. Default: `80`. Only effective when `ENABLE_HLS_PREBUFFER` is `true`.
 - `HLS_PREBUFFER_EMERGENCY_THRESHOLD`: Optional. Emergency threshold (%) to trigger aggressive HLS cache cleanup. Default: `90`. Only effective when `ENABLE_HLS_PREBUFFER` is `true`.
-- `ENABLE_DASH_PREBUFFER`: Optional. Enables DASH pre-buffering for improved streaming performance. Default: `false`. Enable this when you experience frequent buffering or want to improve playback smoothness for high-bitrate streams. Note that enabling pre-buffering increases memory usage and may not be suitable for low-memory environments.
+- `HLS_PREBUFFER_INACTIVITY_TIMEOUT`: Optional. Seconds of inactivity before stopping HLS playlist refresh. Default: `60`. Helps clean up resources when streams are stopped.
+- `LIVESTREAM_START_OFFSET`: Optional. Default start offset (in seconds) for live streams (HLS and MPD). Default: `-18`. This injects `#EXT-X-START:TIME-OFFSET` into live media playlists, causing players to start behind the live edge. This creates headroom for prebuffering to work effectively on live streams. Set to empty/unset to disable automatic injection for live streams.
+- `ENABLE_DASH_PREBUFFER`: Optional. Enables DASH pre-buffering for improved streaming performance. Default: `true`. Pre-buffering downloads upcoming segments ahead of playback to reduce buffering. Set to `false` to disable for low-memory environments.
 - `DASH_PREBUFFER_SEGMENTS`: Optional. Number of DASH segments to pre-buffer ahead. Default: `5`. Only effective when `ENABLE_DASH_PREBUFFER` is `true`.
 - `DASH_PREBUFFER_CACHE_SIZE`: Optional. Maximum number of DASH segments to keep in memory cache. Default: `50`. Only effective when `ENABLE_DASH_PREBUFFER` is `true`.
 - `DASH_PREBUFFER_MAX_MEMORY_PERCENT`: Optional. Maximum percentage of system memory to use for DASH pre-buffer cache. Default: `80`. Only effective when `ENABLE_DASH_PREBUFFER` is `true`.
 - `DASH_PREBUFFER_EMERGENCY_THRESHOLD`: Optional. Emergency threshold (%) to trigger aggressive DASH cache cleanup. Default: `90`. Only effective when `ENABLE_DASH_PREBUFFER` is `true`.
+- `DASH_PREBUFFER_INACTIVITY_TIMEOUT`: Optional. Seconds of inactivity before cleaning up DASH stream state. Default: `60`. Helps clean up resources when streams are stopped.
+- `DASH_SEGMENT_CACHE_TTL`: Optional. TTL in seconds for cached DASH segments. Default: `60`. Longer values help with slow network playback.
 - `FORWARDED_ALLOW_IPS`: Optional. Controls which IP addresses are trusted to provide forwarded headers (X-Forwarded-For, X-Forwarded-Proto, etc.) when MediaFlow Proxy is deployed behind reverse proxies or load balancers. Default: `127.0.0.1`. See [Forwarded Headers Configuration](#forwarded-headers-configuration) for detailed usage.
+
+### Acestream Configuration
+
+MediaFlow Proxy can act as a proxy for Acestream P2P streams, converting them to HLS or MPEG-TS format that any media player can consume.
+
+**Requirements**: You need a running Acestream engine accessible from MediaFlow Proxy.
+
+- `ENABLE_ACESTREAM`: Optional. Enable Acestream proxy support. Default: `false`.
+- `ACESTREAM_HOST`: Optional. Acestream engine host. Default: `localhost`.
+- `ACESTREAM_PORT`: Optional. Acestream engine port. Default: `6878`.
+- `ACESTREAM_SESSION_TIMEOUT`: Optional. Session timeout (seconds) for cleanup of inactive sessions. Default: `60`.
+- `ACESTREAM_KEEPALIVE_INTERVAL`: Optional. Interval (seconds) for session keepalive polling. Default: `15`.
+
+#### Acestream Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `/proxy/acestream/stream` | MPEG-TS stream proxy (recommended) |
+| `/proxy/acestream/manifest.m3u8` | HLS manifest proxy |
+| `/proxy/acestream/status` | Get session status |
+
+#### Acestream URL Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `id` | Acestream content ID (alternative to infohash) |
+| `infohash` | Acestream infohash (40-char hex from magnet link) |
+
+**Example URLs:**
+```
+# MPEG-TS stream (recommended)
+https://your-mediaflow/proxy/acestream/stream?id=YOUR_CONTENT_ID&api_password=your_password
+
+# MPEG-TS stream (infohash from magnet)
+https://your-mediaflow/proxy/acestream/stream?infohash=b04372b9543d763bd2dbd2a1842d9723fd080076&api_password=your_password
+
+# HLS manifest (alternative)
+https://your-mediaflow/proxy/acestream/manifest.m3u8?id=YOUR_CONTENT_ID&api_password=your_password
+```
+
+#### Docker Compose Example with Acestream
+
+```yaml
+services:
+  mediaflow-proxy:
+    image: mhdzumair/mediaflow-proxy:latest
+    ports:
+      - "8888:8888"
+    environment:
+      - API_PASSWORD=your_password
+      - ENABLE_ACESTREAM=true
+      - ACESTREAM_HOST=acestream
+      - ACESTREAM_PORT=6878
+
+  acestream:
+    image: ghcr.io/martinbjeldbak/acestream-http-proxy:latest # or build it from https://github.com/sergiomarquezdev/acestream-docker-home
+    ports:
+      - "6878:6878"
+```
 
 ### Transport Configuration
 
@@ -655,10 +819,10 @@ MediaFlow Proxy now includes a built-in speed test feature for testing RealDebri
    > **Note**
    > > Omit `--forwarded-allow-ips "*"` when running locally.
 
-#### Using git & poetry
+#### Using git & uv
 
 > [!IMPORTANT]
-> Ensure that you have Python 3.10 or higher installed.
+> Ensure that you have Python 3.10 or higher and [uv](https://docs.astral.sh/uv/getting-started/installation/) installed.
 
 
 1. Clone the repository:
@@ -667,9 +831,9 @@ MediaFlow Proxy now includes a built-in speed test feature for testing RealDebri
    cd mediaflow-proxy
    ```
 
-2. Install dependencies using Poetry:
+2. Install dependencies using uv:
    ```
-   poetry install
+   uv sync
    ```
 
 3. Set the `API_PASSWORD` environment variable in `.env`:
@@ -679,7 +843,7 @@ MediaFlow Proxy now includes a built-in speed test feature for testing RealDebri
 
 4. Run the FastAPI server:
    ```
-   poetry run uvicorn mediaflow_proxy.main:app --host 0.0.0.0 --port 8888 --workers 4 --forwarded-allow-ips "*"
+   uv run uvicorn mediaflow_proxy.main:app --host 0.0.0.0 --port 8888 --workers 4 --forwarded-allow-ips "*"
    ```
 
    > **Note**
@@ -754,18 +918,193 @@ Ideal for users who want a reliable, plug-and-play solution without the technica
 
 Once the server is running, for more details on the available endpoints and their parameters, visit the Swagger UI at `http://localhost:8888/docs`.
 
-### New URL Parameters
+### Xtream Codes (XC) API Proxy
+
+MediaFlow Proxy can act as a stateless pass-through proxy for Xtream Codes API, allowing you to proxy streams from XC-compatible IPTV providers through MediaFlow. This is particularly useful for:
+
+- Proxying streams from providers with **Catch Up/Timeshift** support
+- Using MediaFlow's features (headers, DRM, etc.) with XC streams
+- Routing XC streams through a specific network path
+
+#### Configuration
+
+Configure your IPTV player with the following settings:
+
+| Setting | Value |
+|---------|-------|
+| **Server URL** | `http://your-mediaflow-server:8888` |
+| **Username** | Base64-encoded string (see below) |
+| **Password** | Your XC provider password |
+
+#### Username Format (Recommended)
+
+The username should be a **base64-encoded string** containing your provider URL, XC username, and MediaFlow API password. This format is compatible with all IPTV players (TiviMate, IPTV Smarters, OTT Navigator, etc.).
+
+**Format before encoding:**
+```
+{provider_url}:{xc_username}:{api_password}
+```
+
+**Example:**
+```
+http://provider.com:8080:myusername:my_mediaflow_password
+```
+
+After base64 encoding, this becomes a single string like:
+```
+aHR0cDovL3Byb3ZpZGVyLmNvbTo4MDgwOm15dXNlcm5hbWU6bXlfbWVkaWFmbG93X3Bhc3N3b3Jk
+```
+
+**Without MediaFlow API password:**
+```
+http://provider.com:8080:myusername
+```
+
+Encoded:
+```
+aHR0cDovL3Byb3ZpZGVyLmNvbTo4MDgwOm15dXNlcm5hbWU
+```
+
+#### Generating the Username
+
+Use the **URL Generator tool** at `http://your-mediaflow-server:8888/url-generator` (recommended) or manually:
+
+**Using command line:**
+```bash
+# With API password
+echo -n "http://provider.com:8080:myusername:my_api_password" | base64
+
+# Without API password
+echo -n "http://provider.com:8080:myusername" | base64
+```
+
+**Using Python:**
+```python
+import base64
+
+# With API password
+combined = "http://provider.com:8080:myusername:my_api_password"
+encoded = base64.urlsafe_b64encode(combined.encode()).decode().rstrip('=')
+print(encoded)
+
+# Without API password
+combined = "http://provider.com:8080:myusername"
+encoded = base64.urlsafe_b64encode(combined.encode()).decode().rstrip('=')
+print(encoded)
+```
+
+#### Legacy Format (Still Supported)
+
+The legacy colon-separated format is still supported for backward compatibility:
+```
+{base64_upstream}:{actual_username}:{api_password}
+```
+
+However, some IPTV apps may not handle colons in the username field correctly. The new base64-encoded format is recommended.
+
+#### Supported XC API Endpoints
+
+MediaFlow proxies all standard XC API endpoints:
+
+| Endpoint | Description |
+|----------|-------------|
+| `/player_api.php` | Main API for categories, streams, VOD, series |
+| `/xmltv.php` | EPG/TV Guide data |
+| `/get.php` | M3U playlist generation |
+| `/panel_api.php` | Panel API (if supported by provider) |
+| `/live/{user}/{pass}/{id}.{ext}` | Live stream playback |
+| `/movie/{user}/{pass}/{id}.{ext}` | VOD/Movie playback |
+| `/series/{user}/{pass}/{id}.{ext}` | Series episode playback |
+| `/timeshift/{user}/{pass}/{duration}/{start}/{id}.{ext}` | Catch-up/Timeshift playback |
+
+#### Player Configuration Examples
+
+**TiviMate:**
+1. Add Playlist → Xtream Codes Login
+2. Server: `http://your-mediaflow-server:8888`
+3. Username: Paste the base64-encoded username from the URL Generator
+4. Password: Your XC password
+
+**IPTV Smarters:**
+1. Add User → Xtream Codes API
+2. Any Name: Your choice
+3. Username: Paste the base64-encoded username from the URL Generator
+4. Password: Your XC password
+5. URL: `http://your-mediaflow-server:8888`
+
+**OTT Navigator:**
+1. Add Provider → Xtream
+2. Portal URL: `http://your-mediaflow-server:8888`
+3. Login: Paste the base64-encoded username from the URL Generator
+4. Password: Your XC password
+
+### URL Parameters
 
 **`&max_res=true`**  
 Forces playback at the highest available quality (maximum resolution) supported by the stream.  
 - **Usage:** Add `&max_res=true` to the proxy URL  
 - **Effect:** Only the highest quality rendition will be selected and served.  
-- **Note:** This parameter is mainly effective with VixSrc (and similar) sources.
+- **Note:** This parameter is effective with HLS and MPD streams.
+
+**`&resolution=720p`**  
+Select a specific resolution stream instead of the highest or default.  
+- **Usage:** Add `&resolution=720p` (or `1080p`, `480p`, `360p`, etc.) to the proxy URL  
+- **Effect:** Selects the stream matching the specified resolution. Falls back to the closest lower resolution if exact match is not found.  
+- **Supported Endpoints:** `/proxy/hls/manifest.m3u8`, `/proxy/mpd/manifest.m3u8`
 
 **`&no_proxy=true`**  
 Disables the proxy for the current destination, performing a direct request.  
 - **Usage:** Add `&no_proxy=true` to the proxy URL  
 - **Effect:** Bypasses all proxy functions for the destination, useful for debugging or testing stream access directly.
+
+**`&skip=0-112,280-300`**  
+Skip specific time ranges in HLS and DASH/MPD streams. Useful for skipping intros, outros, credits, or any unwanted content.  
+- **Usage:** Add `&skip=start-end,start-end,...` to the proxy URL (times in seconds)  
+- **Effect:** Removes segments that overlap with the specified time ranges and inserts `#EXT-X-DISCONTINUITY` markers for seamless playback.  
+- **Supported Endpoints:** `/proxy/hls/manifest.m3u8`, `/proxy/mpd/manifest.m3u8`, `/proxy/mpd/playlist.m3u8`  
+- **Precision:** Segment-level precision (segments overlapping with skip ranges are removed entirely)  
+- **Decimal Support:** Supports decimal values for precise timing (e.g., `skip=0-112.5,120.25-150.75`)  
+- **Example:** `&skip=0-90` skips the first 90 seconds (intro), `&skip=0-90,1750-1800` skips intro and outro
+
+**`&start_offset=-18`**  
+Inject `#EXT-X-START:TIME-OFFSET` tag into HLS playlists to control playback start position. Particularly useful for live streams to enable prebuffering.  
+- **Usage:** Add `&start_offset=-18` to the proxy URL (negative value for live streams)  
+- **Effect:** Injects `#EXT-X-START:TIME-OFFSET=-18.0,PRECISE=YES` into the HLS manifest, causing players to start playback behind the live edge.  
+- **Supported Endpoints:** `/proxy/hls/manifest.m3u8`, `/proxy/mpd/playlist.m3u8`, `/proxy/acestream/manifest.m3u8`  
+- **Use Case:** For live streams, starting behind the live edge creates headroom for the prebuffer system to prefetch upcoming segments, resulting in smoother playback without buffering.  
+- **Default:** Can be configured globally via `LIVESTREAM_START_OFFSET` environment variable (default: `-18` for live streams). Set to empty to disable.  
+- **Note:** When using the default setting, the offset is only applied to live media playlists (not VOD or master playlists). Explicit `start_offset` parameter overrides this behavior.  
+- **Example:** `&start_offset=-18` starts playback 18 seconds behind the live edge
+
+**`&x_headers=content-length,transfer-encoding`**  
+Remove specific headers from the proxied response.  
+- **Usage:** Add `&x_headers=header1,header2` to the proxy URL (comma-separated list)  
+- **Effect:** Removes the specified headers from the upstream response before forwarding to the client.  
+- **Use Case:** Useful when upstream servers send incorrect headers (e.g., wrong `Content-Length`) that cause playback issues.  
+- **Example:** `&x_headers=content-length` removes the Content-Length header, allowing chunked transfer encoding.
+
+**`&transformer=ts_stream`**  
+Apply stream content transformations for specific hosting providers.  
+- **Usage:** Add `&transformer=transformer_id` to the proxy URL  
+- **Effect:** Processes stream chunks through a transformer that handles host-specific obfuscation or encoding.  
+- **Available Transformers:**
+  - `ts_stream` - Handles MPEG-TS streams wrapped in fake PNG containers with 0xFF padding (used by TurboVidPlay, StreamWish, FileMoon, etc.)
+- **How it works:** Some video hosts disguise their TS segments as PNG images to evade detection. The `ts_stream` transformer:
+  1. Detects and strips the fake PNG header (89 50 4E 47...)
+  2. Finds and removes the PNG IEND marker
+  3. Skips any 0xFF padding bytes
+  4. Locates the actual MPEG-TS sync byte (0x47) with packet alignment verification
+  5. Outputs clean, playable MPEG-TS data
+- **Example:** `&transformer=ts_stream&x_headers=content-length,content-range` for streams with PNG wrappers.
+- **Note:** This parameter is automatically set when using extractors for supported hosts.
+
+**`&rp_content-type=video/mp2t`**  
+Set response headers that propagate to HLS/DASH segments.  
+- **Usage:** Add `&rp_header-name=value` to the proxy URL (rp_ prefix)  
+- **Effect:** These headers are applied to segment responses AND propagated to segment URLs in the manifest.  
+- **Use Case:** Override content-type for segments disguised as other file types (e.g., PNG files containing video data).  
+- **Difference from `r_` prefix:** `r_` headers only apply to the manifest response, while `rp_` headers propagate to all segment requests.  
+- **Example:** `&rp_content-type=video/mp2t` sets the content-type to video/mp2t for all segments.
 
 ### Examples
 
@@ -811,19 +1150,85 @@ http://localhost:8888/proxy/hls/manifest.m3u8?d=https://iptv.provider.com/stream
 - **Provider-Specific Streams**: IPTV services with custom playlist formats
 - **Authentication Required**: Streams that need specific headers or authentication
 
+#### HLS Stream with Resolution Selection
+
+```bash
+# Select specific resolution (720p)
+mpv "http://localhost:8888/proxy/hls/manifest.m3u8?d=https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8&resolution=720p&api_password=your_password"
+
+# Select highest resolution
+mpv "http://localhost:8888/proxy/hls/manifest.m3u8?d=https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8&max_res=true&api_password=your_password"
+```
+
+#### HLS/DASH Stream with Segment Skipping (Intro/Outro Skip)
+
+```bash
+# Skip intro (first 90 seconds) in HLS stream
+mpv "http://localhost:8888/proxy/hls/manifest.m3u8?d=https://example.com/playlist.m3u8&skip=0-90&api_password=your_password"
+
+# Skip intro and outro in HLS stream
+mpv "http://localhost:8888/proxy/hls/manifest.m3u8?d=https://example.com/playlist.m3u8&skip=0-112,1750-1800&api_password=your_password"
+
+# Skip intro in DASH/MPD stream
+mpv "http://localhost:8888/proxy/mpd/manifest.m3u8?d=https://example.com/manifest.mpd&skip=0-90&api_password=your_password"
+
+# Skip multiple segments with decimal precision
+mpv "http://localhost:8888/proxy/hls/manifest.m3u8?d=https://example.com/playlist.m3u8&skip=0-112.5,1750.25-1800.75&api_password=your_password"
+```
+
+#### Live Stream with Start Offset (Prebuffer Support)
+
+```bash
+# Start 18 seconds behind the live edge for HLS (allows prebuffer to work effectively)
+mpv "http://localhost:8888/proxy/hls/manifest.m3u8?d=https://example.com/live/playlist.m3u8&start_offset=-18&api_password=your_password"
+
+# For live DASH/MPD streams converted to HLS
+mpv "http://localhost:8888/proxy/mpd/manifest.m3u8?d=https://example.com/live/manifest.mpd&start_offset=-18&api_password=your_password"
+
+# For Acestream live streams with start offset
+mpv "http://localhost:8888/proxy/acestream/manifest.m3u8?id=your_content_id&start_offset=-18&api_password=your_password"
+```
+
+**Note:** The `start_offset` parameter is particularly useful for live streams where the prebuffer system cannot prefetch segments when sitting at the live edge. By starting slightly behind (e.g., `-18` seconds), there are future segments available for prebuffering, resulting in smoother playback. This works for both native HLS and DASH/MPD streams converted to HLS.
+
+#### Stream with Header Removal (Fix Content-Length Issues)
+
+```bash
+# Remove content-length header for streams with incorrect content-length
+mpv "http://localhost:8888/proxy/stream?d=https://example.com/video.mp4&x_headers=content-length&api_password=your_password"
+```
+
+#### Stream with PNG-Wrapped TS Segments (Stream Transformer)
+
+```bash
+# Handle streams where TS segments are disguised as PNG files (TurboVidPlay, StreamWish, FileMoon, etc.)
+mpv "http://localhost:8888/proxy/hls/manifest.m3u8?d=https://example.com/playlist.m3u8&transformer=ts_stream&x_headers=content-length,content-range&api_password=your_password"
+
+# The transformer strips fake PNG headers and 0xFF padding to extract the actual MPEG-TS data
+# Note: When using extractors, the transformer is automatically applied for supported hosts
+```
+
 #### Live DASH Stream (Non-DRM Protected)
 
 ```bash
 mpv -v "http://localhost:8888/proxy/mpd/manifest.m3u8?d=https://livesim.dashif.org/livesim/chunkdur_1/ato_7/testpic4_8s/Manifest.mpd&api_password=your_password"
 ```
 
-#### VOD DASH Stream (DRM Protected)
+#### VOD DASH Stream (DRM Protected - Single Key)
 
 ```bash
 mpv -v "http://localhost:8888/proxy/mpd/manifest.m3u8?d=https://media.axprod.net/TestVectors/v7-MultiDRM-SingleKey/Manifest_1080p_ClearKey.mpd&key_id=nrQFDeRLSAKTLifXUIPiZg&key=FmY0xnWCPCNaSpRG-tUuTQ&api_password=your_password"
 ```
 
-Note: The `key` and `key_id` parameters are automatically processed if they're not in the correct format.
+#### VOD DASH Stream (DRM Protected - Multi-Key)
+
+For streams with different keys for video and audio tracks, provide multiple key_id:key pairs separated by commas:
+
+```bash
+mpv -v "http://localhost:8888/proxy/mpd/manifest.m3u8?d=https://example.com/multikey.mpd&key_id=video_key_id,audio_key_id&key=video_key,audio_key&api_password=your_password"
+```
+
+Note: The `key` and `key_id` parameters are automatically processed if they're not in the correct format. Multi-key support allows decryption of streams where video and audio tracks use different encryption keys.
 
 ### URL Encoding
 
@@ -886,6 +1291,13 @@ data = {
         "referer": "https://example.com/",
         "origin": "https://example.com",
     },
+    "response_headers": {
+        "cache-control": "no-cache",  # Optional: Add custom response headers (r_ prefix, manifest only)
+    },
+    "propagate_response_headers": {
+        "content-type": "video/mp2t",  # Optional: Headers that propagate to segments (rp_ prefix)
+    },
+    "remove_response_headers": ["content-length", "content-range"],  # Optional: Remove specific response headers
     "expiration": 3600,  # URL will expire in 1 hour (only for encrypted URLs)
     "ip": "123.123.123.123",  # Optional: Restrict access to this IP (only for encrypted URLs)
     "api_password": "your_password",  # Add here for encrypted URLs
@@ -901,6 +1313,9 @@ print(encoded_url)
 > - If you add `api_password` at the root level of the request, the URL will be **encrypted**.
 > - If you add `api_password` inside the `query_params` object, the URL will only be **encoded** (not encrypted).
 > - The `filename` parameter is optional and should only be used with the `/proxy/stream` endpoint, not with MPD or HLS proxy endpoints.
+> - The `remove_response_headers` parameter is useful when upstream servers send incorrect headers (e.g., wrong `Content-Length`) that cause playback issues.
+> - The `response_headers` parameter adds headers to the manifest response only (`r_` prefix in URL).
+> - The `propagate_response_headers` parameter adds headers that propagate to segment URLs (`rp_` prefix in URL). Useful for overriding content-type on segments disguised as other file types.
 > - The legacy endpoint `/generate_encrypted_or_encoded_url` is still available but deprecated. It's recommended to use `/generate_url` instead.
 
 #### Multiple URLs Generation
@@ -1153,9 +1568,11 @@ This feature is fully backward compatible:
 - No configuration changes required
 - All existing API endpoints remain unchanged
 
-## Future Development
+## Limitations
 
-- Add support for Widevine and PlayReady decryption
+- **Commercial DRM not supported**: Widevine, PlayReady, and FairPlay DRM systems require license server communication and hardware security modules. These cannot be decrypted by MediaFlow Proxy as they are designed to prevent unauthorized access.
+- **Key rotation not supported**: Streams where encryption keys change mid-playback are not supported.
+- **Only ClearKey DRM**: The proxy can only decrypt content where you already have the decryption keys (ClearKey/AES-128).
 
 ## Acknowledgements and Inspirations
 
@@ -1163,7 +1580,8 @@ MediaFlow Proxy was developed with inspiration from various projects and resourc
 
 - [Stremio Server](https://github.com/Stremio/stremio-server) for HLS Proxify implementation, which inspired our HLS M3u8 Manifest parsing and redirection proxify support.
 - [Comet Debrid proxy](https://github.com/g0ldyy/comet) for the idea of proxifying HTTPS video streams.
-- [mp4decrypt](https://www.bento4.com/developers/dash/encryption_and_drm/), [mp4box](https://wiki.gpac.io/xmlformats/Common-Encryption/), and [devine](https://github.com/devine-dl/devine) for insights on parsing MPD and decrypting Clear Key DRM protected content.
+- [Acexy](https://github.com/Javinator9889/acexy) for the Acestream proxy implementation inspiration, particularly the stream multiplexing and session management concepts.
+- [Bento4 mp4decrypt](https://www.bento4.com/developers/dash/encryption_and_drm/), [GPAC mp4box](https://wiki.gpac.io/xmlformats/Common-Encryption/), [Shaka Packager](https://github.com/shaka-project/shaka-packager), and [devine](https://github.com/devine-dl/devine) for insights on parsing MPD and decrypting CENC/ClearKey DRM protected content across all encryption modes (cenc, cens, cbc1, cbcs).
 - Test URLs were sourced from:
   - [OTTVerse MPEG-DASH MPD Examples](https://ottverse.com/free-mpeg-dash-mpd-manifest-example-test-urls/)
   - [OTTVerse HLS M3U8 Examples](https://ottverse.com/free-hls-m3u8-test-urls/)

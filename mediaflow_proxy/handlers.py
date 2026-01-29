@@ -1,16 +1,19 @@
+import asyncio
 import base64
 import logging
+from typing import Optional
 from urllib.parse import urlparse, parse_qs
 
-import httpx
+import aiohttp
 import tenacity
 from fastapi import Request, Response, HTTPException
 from starlette.background import BackgroundTask
 
 from .const import SUPPORTED_RESPONSE_HEADERS
-from .mpd_processor import process_manifest, process_playlist, process_segment
-from .schemas import HLSManifestParams, MPDManifestParams, MPDPlaylistParams, MPDSegmentParams
-from .utils.cache_utils import get_cached_mpd, get_cached_init_segment
+from .mpd_processor import process_manifest, process_playlist, process_segment, process_init_segment
+from .schemas import HLSManifestParams, MPDManifestParams, MPDPlaylistParams, MPDSegmentParams, MPDInitParams
+from .utils.cache_utils import get_cached_mpd, get_cached_init_segment, get_cached_segment, set_cached_segment
+from .utils.dash_prebuffer import dash_prebuffer
 from .utils.http_utils import (
     Streamer,
     DownloadError,
@@ -18,24 +21,15 @@ from .utils.http_utils import (
     request_with_retry,
     EnhancedStreamingResponse,
     ProxyRequestHeaders,
-    create_httpx_client,
+    create_streamer,
+    apply_header_manipulation,
 )
 from .utils.m3u8_processor import M3U8Processor
 from .utils.mpd_utils import pad_base64
+from .utils.stream_transformers import StreamTransformer, get_transformer
 from .configs import settings
 
 logger = logging.getLogger(__name__)
-
-
-async def setup_client_and_streamer() -> tuple[httpx.AsyncClient, Streamer]:
-    """
-    Set up an HTTP client and a streamer.
-
-    Returns:
-        tuple: An httpx.AsyncClient instance and a Streamer instance.
-    """
-    client = create_httpx_client()
-    return client, Streamer(client)
 
 
 def handle_exceptions(exception: Exception) -> Response:
@@ -48,21 +42,33 @@ def handle_exceptions(exception: Exception) -> Response:
     Returns:
         Response: An HTTP response corresponding to the exception type.
     """
-    if isinstance(exception, httpx.HTTPStatusError):
-        logger.error(f"Upstream service error while handling request: {exception}")
-        return Response(status_code=exception.response.status_code, content=f"Upstream service error: {exception}")
+    if isinstance(exception, aiohttp.ClientResponseError):
+        if exception.status == 404:
+            logger.debug(f"Upstream 404: {exception.request_info.url if exception.request_info else 'unknown'}")
+        else:
+            logger.error(f"Upstream service error while handling request: {exception}")
+        return Response(status_code=exception.status, content=f"Upstream service error: {exception}")
     elif isinstance(exception, DownloadError):
         logger.error(f"Error downloading content: {exception}")
         return Response(status_code=exception.status_code, content=str(exception))
     elif isinstance(exception, tenacity.RetryError):
         return Response(status_code=502, content="Max retries exceeded while downloading content")
+    elif isinstance(exception, asyncio.TimeoutError):
+        logger.error(f"Timeout error: {exception}")
+        return Response(status_code=504, content="Gateway timeout")
+    elif isinstance(exception, aiohttp.ClientError):
+        logger.error(f"Client error: {exception}")
+        return Response(status_code=502, content=f"Upstream connection error: {exception}")
     else:
         logger.exception(f"Internal server error while handling request: {exception}")
         return Response(status_code=502, content=f"Internal server error: {exception}")
 
 
 async def handle_hls_stream_proxy(
-    request: Request, hls_params: HLSManifestParams, proxy_headers: ProxyRequestHeaders
+    request: Request,
+    hls_params: HLSManifestParams,
+    proxy_headers: ProxyRequestHeaders,
+    transformer_id: Optional[str] = None,
 ) -> Response:
     """
     Handle HLS stream proxy requests.
@@ -73,11 +79,12 @@ async def handle_hls_stream_proxy(
         request (Request): The incoming FastAPI request object.
         hls_params (HLSManifestParams): Parameters for the HLS manifest.
         proxy_headers (ProxyRequestHeaders): Headers to be used in the proxy request.
+        transformer_id (str, optional): ID of the stream transformer to use for segment streaming.
 
     Returns:
         Union[Response, EnhancedStreamingResponse]: Either a processed m3u8 playlist or a streaming response.
     """
-    _, streamer = await setup_client_and_streamer()
+    streamer = await create_streamer()
     # Handle range requests
     content_range = proxy_headers.request.get("range", "bytes=0-")
     if "nan" in content_range.casefold():
@@ -90,6 +97,7 @@ async def handle_hls_stream_proxy(
         if "vavoo.to" in hls_params.destination:
             try:
                 from mediaflow_proxy.extractors.vavoo import VavooExtractor
+
                 vavoo_extractor = VavooExtractor(proxy_headers.request)
                 resolved_data = await vavoo_extractor.extract(hls_params.destination)
                 resolved_url = resolved_data["destination_url"]
@@ -100,11 +108,26 @@ async def handle_hls_stream_proxy(
                 logger.warning(f"Failed to auto-resolve Vavoo URL: {e}")
                 # Continue with original URL if resolution fails
 
+        # Parse skip_segments from JSON string to list
+        skip_segments_list = hls_params.get_skip_segments()
+
+        # Get transformer instance if specified
+        transformer = get_transformer(transformer_id)
+
         # If force_playlist_proxy is enabled, skip detection and directly process as m3u8
         if hls_params.force_playlist_proxy:
             return await fetch_and_process_m3u8(
-                streamer, hls_params.destination, proxy_headers, request, 
-                hls_params.key_url, hls_params.force_playlist_proxy, hls_params.key_only_proxy, hls_params.no_proxy
+                streamer,
+                hls_params.destination,
+                proxy_headers,
+                request,
+                hls_params.key_url,
+                hls_params.force_playlist_proxy,
+                hls_params.key_only_proxy,
+                hls_params.no_proxy,
+                skip_segments_list,
+                transformer,
+                hls_params.start_offset,
             )
 
         parsed_url = urlparse(hls_params.destination)
@@ -113,23 +136,49 @@ async def handle_hls_stream_proxy(
             0
         ] in ["m3u", "m3u8", "m3u_plus"]:
             return await fetch_and_process_m3u8(
-                streamer, hls_params.destination, proxy_headers, request, 
-                hls_params.key_url, hls_params.force_playlist_proxy, hls_params.key_only_proxy, hls_params.no_proxy
+                streamer,
+                hls_params.destination,
+                proxy_headers,
+                request,
+                hls_params.key_url,
+                hls_params.force_playlist_proxy,
+                hls_params.key_only_proxy,
+                hls_params.no_proxy,
+                skip_segments_list,
+                transformer,
+                hls_params.start_offset,
             )
 
         # Create initial streaming response to check content type
         await streamer.create_streaming_response(hls_params.destination, proxy_headers.request)
-        response_headers = prepare_response_headers(streamer.response.headers, proxy_headers.response)
+        response_headers = prepare_response_headers(
+            streamer.response.headers, proxy_headers.response, proxy_headers.remove, proxy_headers.propagate
+        )
 
         if "mpegurl" in response_headers.get("content-type", "").lower():
             return await fetch_and_process_m3u8(
-                streamer, hls_params.destination, proxy_headers, request, 
-                hls_params.key_url, hls_params.force_playlist_proxy, hls_params.key_only_proxy, hls_params.no_proxy
+                streamer,
+                hls_params.destination,
+                proxy_headers,
+                request,
+                hls_params.key_url,
+                hls_params.force_playlist_proxy,
+                hls_params.key_only_proxy,
+                hls_params.no_proxy,
+                skip_segments_list,
+                transformer,
+                hls_params.start_offset,
             )
 
+        # If we're removing content-range but upstream returned 206, change to 200
+        # (206 Partial Content requires Content-Range header per HTTP spec)
+        status_code = streamer.response.status
+        if status_code == 206 and "content-range" in [h.lower() for h in proxy_headers.remove]:
+            status_code = 200
+
         return EnhancedStreamingResponse(
-            streamer.stream_content(),
-            status_code=streamer.response.status_code,
+            streamer.stream_content(transformer),
+            status_code=status_code,
             headers=response_headers,
             background=BackgroundTask(streamer.close),
         )
@@ -142,6 +191,7 @@ async def handle_stream_request(
     method: str,
     video_url: str,
     proxy_headers: ProxyRequestHeaders,
+    transformer_id: Optional[str] = None,
 ) -> Response:
     """
     Handle general stream requests.
@@ -152,17 +202,19 @@ async def handle_stream_request(
         method (str): The HTTP method (e.g., 'GET' or 'HEAD').
         video_url (str): The URL of the video to stream.
         proxy_headers (ProxyRequestHeaders): Headers to be used in the proxy request.
+        transformer_id (str, optional): ID of the stream transformer to use for content manipulation.
 
     Returns:
         Union[Response, EnhancedStreamingResponse]: Either a HEAD response with headers or a streaming response.
     """
-    client, streamer = await setup_client_and_streamer()
+    streamer = await create_streamer(video_url)
 
     try:
         # Auto-detect and resolve Vavoo links
         if "vavoo.to" in video_url:
             try:
                 from mediaflow_proxy.extractors.vavoo import VavooExtractor
+
                 vavoo_extractor = VavooExtractor(proxy_headers.request)
                 resolved_data = await vavoo_extractor.extract(video_url)
                 resolved_url = resolved_data["destination_url"]
@@ -173,19 +225,38 @@ async def handle_stream_request(
                 logger.warning(f"Failed to auto-resolve Vavoo URL: {e}")
                 # Continue with original URL if resolution fails
 
+        # Debug: log request headers being sent
+        logger.debug(f"Request headers being sent to upstream: {proxy_headers.request}")
         await streamer.create_streaming_response(video_url, proxy_headers.request)
-        response_headers = prepare_response_headers(streamer.response.headers, proxy_headers.response)
+
+        # Debug: log upstream response headers
+        logger.debug(f"Upstream response status: {streamer.response.status}")
+        logger.debug(f"Upstream response headers: {dict(streamer.response.headers)}")
+
+        response_headers = prepare_response_headers(
+            streamer.response.headers, proxy_headers.response, proxy_headers.remove, proxy_headers.propagate
+        )
+        logger.debug(f"Prepared response headers: {response_headers}")
+
+        # If we're removing content-range but upstream returned 206, change to 200
+        # (206 Partial Content requires Content-Range header per HTTP spec)
+        status_code = streamer.response.status
+        if status_code == 206 and "content-range" in [h.lower() for h in proxy_headers.remove]:
+            status_code = 200
+
+        # Get transformer instance if specified
+        transformer = get_transformer(transformer_id)
 
         if method == "HEAD":
             # For HEAD requests, just return the headers without streaming content
             await streamer.close()
-            return Response(headers=response_headers, status_code=streamer.response.status_code)
+            return Response(headers=response_headers, status_code=status_code)
         else:
             # For GET requests, return the streaming response
             return EnhancedStreamingResponse(
-                streamer.stream_content(),
+                streamer.stream_content(transformer),
                 headers=response_headers,
-                status_code=streamer.response.status_code,
+                status_code=status_code,
                 background=BackgroundTask(streamer.close),
             )
     except Exception as e:
@@ -193,7 +264,9 @@ async def handle_stream_request(
         return handle_exceptions(e)
 
 
-def prepare_response_headers(original_headers, proxy_response_headers) -> dict:
+def prepare_response_headers(
+    original_headers, proxy_response_headers, remove_headers=None, propagate_headers=None
+) -> dict:
     """
     Prepare response headers for the proxy response.
 
@@ -201,18 +274,36 @@ def prepare_response_headers(original_headers, proxy_response_headers) -> dict:
     and merges them with the proxy response headers.
 
     Args:
-        original_headers (httpx.Headers): The original headers from the upstream response.
+        original_headers: The original headers from the upstream response (aiohttp CIMultiDictProxy).
         proxy_response_headers (dict): Additional headers to be included in the proxy response.
+        remove_headers (list, optional): List of header names to remove from the response. Defaults to None.
+        propagate_headers (dict, optional): Headers that propagate to segments (rp_ prefix). Defaults to None.
 
     Returns:
         dict: The prepared headers for the proxy response.
     """
-    response_headers = {k: v for k, v in original_headers.multi_items() if k in SUPPORTED_RESPONSE_HEADERS}
+    remove_set = set(h.lower() for h in (remove_headers or []))
+    response_headers = {}
+
+    # Handle aiohttp CIMultiDictProxy
+    for k, v in original_headers.items():
+        k_lower = k.lower()
+        if k_lower in SUPPORTED_RESPONSE_HEADERS and k_lower not in remove_set:
+            response_headers[k_lower] = v
+
+    # Apply propagate headers first (for segments), then response headers (response takes precedence)
+    if propagate_headers:
+        response_headers.update(propagate_headers)
     response_headers.update(proxy_response_headers)
     return response_headers
 
 
-async def proxy_stream(method: str, destination: str, proxy_headers: ProxyRequestHeaders):
+async def proxy_stream(
+    method: str,
+    destination: str,
+    proxy_headers: ProxyRequestHeaders,
+    transformer_id: Optional[str] = None,
+):
     """
     Proxies the stream request to the given video URL.
 
@@ -220,22 +311,26 @@ async def proxy_stream(method: str, destination: str, proxy_headers: ProxyReques
         method (str): The HTTP method (e.g., GET, HEAD).
         destination (str): The URL of the stream to be proxied.
         proxy_headers (ProxyRequestHeaders): The headers to include in the request.
+        transformer_id (str, optional): ID of the stream transformer to use.
 
     Returns:
         Response: The HTTP response with the streamed content.
     """
-    return await handle_stream_request(method, destination, proxy_headers)
+    return await handle_stream_request(method, destination, proxy_headers, transformer_id)
 
 
 async def fetch_and_process_m3u8(
-    streamer: Streamer, 
-    url: str, 
-    proxy_headers: ProxyRequestHeaders, 
-    request: Request, 
-    key_url: str = None, 
+    streamer: Streamer,
+    url: str,
+    proxy_headers: ProxyRequestHeaders,
+    request: Request,
+    key_url: str = None,
     force_playlist_proxy: bool = None,
     key_only_proxy: bool = False,
-    no_proxy: bool = False
+    no_proxy: bool = False,
+    skip_segments: list = None,
+    transformer: Optional[StreamTransformer] = None,
+    start_offset: float = None,
 ):
     """
     Fetches and processes the m3u8 playlist on-the-fly, converting it to an HLS playlist.
@@ -249,6 +344,11 @@ async def fetch_and_process_m3u8(
         force_playlist_proxy (bool, optional): Force all playlist URLs to be proxied through MediaFlow. Defaults to None.
         key_only_proxy (bool, optional): Only proxy the key URL, leaving segment URLs direct. Defaults to False.
         no_proxy (bool, optional): If True, returns the manifest without proxying any URLs. Defaults to False.
+        skip_segments (list, optional): List of time segments to skip. Each item should have
+                                        'start', 'end' (in seconds), and optionally 'type'.
+        transformer (StreamTransformer, optional): Transformer to apply to the stream content.
+        start_offset (float, optional): Time offset in seconds for EXT-X-START tag. Use negative
+                                       values for live streams to start behind the live edge.
 
     Returns:
         Response: The HTTP response with the processed m3u8 playlist.
@@ -259,20 +359,56 @@ async def fetch_and_process_m3u8(
             await streamer.create_streaming_response(url, proxy_headers.request)
 
         # Initialize processor and response headers
-        processor = M3U8Processor(request, key_url, force_playlist_proxy, key_only_proxy, no_proxy)
-        response_headers = {
+        # skip_segments is already a list of dicts with 'start' and 'end' keys
+        processor = M3U8Processor(
+            request, key_url, force_playlist_proxy, key_only_proxy, no_proxy, skip_segments, start_offset
+        )
+        base_headers = {
             "content-disposition": "inline",
             "accept-ranges": "none",
             "content-type": "application/vnd.apple.mpegurl",
         }
-        response_headers.update(proxy_headers.response)
+        # Don't include propagate headers for manifests - they should only apply to segments
+        response_headers = apply_header_manipulation(base_headers, proxy_headers, include_propagate=False)
+
+        # Get the generator for processing
+        m3u8_generator = processor.process_m3u8_streaming(
+            streamer.stream_content(transformer), str(streamer.response.url)
+        )
+
+        # Pre-fetch the first chunk to validate the content before starting the response
+        # This allows us to return a proper HTTP error if the upstream returns HTML
+        first_chunk = None
+        try:
+            first_chunk = await m3u8_generator.__anext__()
+        except ValueError as e:
+            # Upstream returned HTML instead of m3u8
+            await streamer.close()
+            raise HTTPException(status_code=502, detail=str(e))
+        except StopAsyncIteration:
+            # Empty response - this shouldn't happen for valid m3u8
+            await streamer.close()
+            raise HTTPException(status_code=502, detail="Upstream returned empty m3u8 playlist")
+
+        # Create a wrapper that yields the first chunk then continues with the rest
+        async def prefetched_generator():
+            yield first_chunk
+            try:
+                async for chunk in m3u8_generator:
+                    yield chunk
+            except ValueError as e:
+                # This shouldn't happen since we already validated the first chunk,
+                # but handle it gracefully if it does
+                logger.error(f"Unexpected ValueError during m3u8 streaming: {e}")
 
         # Create streaming response with on-the-fly processing
         return EnhancedStreamingResponse(
-            processor.process_m3u8_streaming(streamer.stream_content(), str(streamer.response.url)),
+            prefetched_generator(),
             headers=response_headers,
             background=BackgroundTask(streamer.close),
         )
+    except HTTPException:
+        raise
     except Exception as e:
         await streamer.close()
         return handle_exceptions(e)
@@ -333,9 +469,14 @@ async def get_manifest(
         raise HTTPException(status_code=e.status_code, detail=f"Failed to download MPD: {e.message}")
     drm_info = mpd_dict.get("drmInfo", {})
 
+    # Get skip segments if provided
+    skip_segments = manifest_params.get_skip_segments()
+
     if drm_info and not drm_info.get("isDrmProtected"):
         # For non-DRM protected MPD, we still create an HLS manifest
-        return await process_manifest(request, mpd_dict, proxy_headers, None, None)
+        return await process_manifest(
+            request, mpd_dict, proxy_headers, None, None, manifest_params.resolution, skip_segments
+        )
 
     key_id, key = await handle_drm_key_data(manifest_params.key_id, manifest_params.key, drm_info)
 
@@ -345,7 +486,9 @@ async def get_manifest(
     if key and len(key) != 32:
         key = base64.urlsafe_b64decode(pad_base64(key)).hex()
 
-    return await process_manifest(request, mpd_dict, proxy_headers, key_id, key)
+    return await process_manifest(
+        request, mpd_dict, proxy_headers, key_id, key, manifest_params.resolution, skip_segments
+    )
 
 
 async def get_playlist(
@@ -373,7 +516,13 @@ async def get_playlist(
         )
     except DownloadError as e:
         raise HTTPException(status_code=e.status_code, detail=f"Failed to download MPD: {e.message}")
-    return await process_playlist(request, mpd_dict, playlist_params.profile_id, proxy_headers)
+
+    # Get skip segments if provided
+    skip_segments = playlist_params.get_skip_segments()
+
+    return await process_playlist(
+        request, mpd_dict, playlist_params.profile_id, proxy_headers, skip_segments, playlist_params.start_offset
+    )
 
 
 async def get_segment(
@@ -382,6 +531,10 @@ async def get_segment(
 ):
     """
     Retrieves and processes a media segment, decrypting it if necessary.
+
+    Uses event-based coordination with the DASH prebuffer to prevent duplicate
+    downloads. The prebuffer's get_or_download() handles cache checks, waiting
+    for existing downloads, and starting new downloads as needed.
 
     Args:
         segment_params (MPDSegmentParams): The parameters for the segment request.
@@ -392,13 +545,51 @@ async def get_segment(
     """
     try:
         live_cache_ttl = settings.mpd_live_init_cache_ttl if segment_params.is_live else None
+        segment_url = segment_params.segment_url
+
+        # Use event-based coordination for segment download
+        # get_or_download() handles:
+        # - Cache check
+        # - Waiting for existing downloads (via asyncio.Event)
+        # - Starting new download if needed
+        # - Caching the result
+        if settings.enable_dash_prebuffer:
+            segment_content = await dash_prebuffer.get_or_download(segment_url, proxy_headers.request)
+        else:
+            # Prebuffer disabled - check cache then download directly
+            segment_content = await get_cached_segment(segment_url)
+            if not segment_content:
+                segment_content = await download_file_with_retry(segment_url, proxy_headers.request)
+                # Cache for future requests
+                if segment_content and segment_params.is_live:
+                    asyncio.create_task(
+                        set_cached_segment(segment_url, segment_content, ttl=settings.dash_segment_cache_ttl)
+                    )
+
+        if not segment_content:
+            raise HTTPException(status_code=502, detail="Failed to download segment")
+
+        # Fetch init segment (uses its own cache)
         init_content = await get_cached_init_segment(
             segment_params.init_url,
             proxy_headers.request,
             cache_token=segment_params.key_id,
             ttl=live_cache_ttl,
+            byte_range=segment_params.init_range,
         )
-        segment_content = await download_file_with_retry(segment_params.segment_url, proxy_headers.request)
+
+        # Trigger continuous prefetch for live streams
+        if settings.enable_dash_prebuffer and segment_params.is_live:
+            for mpd_url in dash_prebuffer.active_streams:
+                asyncio.create_task(
+                    dash_prebuffer.prefetch_upcoming_segments(
+                        mpd_url,
+                        segment_url,
+                        proxy_headers.request,
+                    )
+                )
+                break  # Only need to trigger once
+
     except Exception as e:
         return handle_exceptions(e)
 
@@ -409,15 +600,75 @@ async def get_segment(
         proxy_headers,
         segment_params.key_id,
         segment_params.key,
+        use_map=segment_params.use_map,
     )
+
+
+async def get_init_segment(
+    init_params: MPDInitParams,
+    proxy_headers: ProxyRequestHeaders,
+):
+    """
+    Retrieves and processes an initialization segment for EXT-X-MAP.
+
+    Args:
+        init_params (MPDInitParams): The parameters for the init segment request.
+        proxy_headers (ProxyRequestHeaders): The headers to include in the request.
+
+    Returns:
+        Response: The HTTP response with the processed init segment.
+    """
+    try:
+        live_cache_ttl = settings.mpd_live_init_cache_ttl if init_params.is_live else None
+        init_content = await get_cached_init_segment(
+            init_params.init_url,
+            proxy_headers.request,
+            cache_token=init_params.key_id,
+            ttl=live_cache_ttl,
+            byte_range=init_params.init_range,
+        )
+    except Exception as e:
+        return handle_exceptions(e)
+
+    return await process_init_segment(
+        init_content,
+        init_params.mime_type,
+        proxy_headers,
+        init_params.key_id,
+        init_params.key,
+        init_params.init_url,
+    )
+
+
+IP_LOOKUP_SERVICES = [
+    {"url": "https://api.ipify.org?format=json", "key": "ip"},
+    {"url": "https://ipinfo.io/json", "key": "ip"},
+    {"url": "https://httpbin.org/ip", "key": "origin"},
+]
 
 
 async def get_public_ip():
     """
     Retrieves the public IP address of the MediaFlow proxy.
+    Tries multiple services for reliability.
 
     Returns:
-        Response: The HTTP response with the public IP address.
+        dict: A dictionary with the public IP address {"ip": "x.x.x.x"}.
+
+    Raises:
+        DownloadError: If all IP lookup services fail.
     """
-    ip_address_data = await request_with_retry("GET", "https://api.ipify.org?format=json", {})
-    return ip_address_data.json()
+    for service in IP_LOOKUP_SERVICES:
+        try:
+            response = await request_with_retry("GET", service["url"], {})
+            content = await response.text()
+            import json
+
+            data = json.loads(content)
+            ip = data.get(service["key"])
+            if ip:
+                return {"ip": ip.strip()}
+        except Exception:
+            continue
+
+    raise DownloadError(503, "Failed to retrieve public IP from all services")

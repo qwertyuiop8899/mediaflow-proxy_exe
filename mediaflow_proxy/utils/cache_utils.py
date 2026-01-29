@@ -1,4 +1,5 @@
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
@@ -8,6 +9,7 @@ import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union, Any
@@ -219,7 +221,7 @@ class HybridCache:
             logger.error(f"Error writing to cache: {e}")
             try:
                 await aiofiles.os.remove(temp_path)
-            except:
+            except OSError:
                 pass
             return False
 
@@ -237,6 +239,42 @@ class HybridCache:
         except Exception as e:
             logger.error(f"Error deleting from cache: {e}")
             return False
+
+    def clear(self) -> bool:
+        """Clear all items from both memory and file caches (synchronous).
+
+        This method is safe to call from multiple processes - if the directory
+        was already deleted by another process, it will simply recreate it.
+        """
+        import shutil
+
+        # Clear memory cache
+        with self.memory_cache._lock:
+            self.memory_cache._cache.clear()
+            self.memory_cache._current_size = 0
+
+        # Clear file cache directory
+        try:
+            if self.cache_dir.exists():
+                shutil.rmtree(self.cache_dir)
+                logger.info(f"Cleared cache directory: {self.cache_dir}")
+            else:
+                logger.debug(f"Cache directory already cleared: {self.cache_dir}")
+        except FileNotFoundError:
+            # Directory was already deleted by another process (race condition with multiple workers)
+            logger.debug(f"Cache directory already cleared by another process: {self.cache_dir}")
+        except Exception as e:
+            logger.error(f"Error clearing cache directory: {e}")
+            return False
+
+        # Recreate the directory
+        try:
+            self._init_cache_dirs()
+        except Exception as e:
+            logger.error(f"Error recreating cache directory: {e}")
+            return False
+
+        return True
 
 
 class AsyncMemoryCache:
@@ -279,11 +317,151 @@ class AsyncMemoryCache:
             return False
 
 
+class CrossProcessLock:
+    """
+    File-based lock for cross-process coordination.
+
+    Uses fcntl.flock() for cross-process locking, which works across
+    multiple uvicorn workers. Each lock is represented by a file in
+    the lock directory.
+    """
+
+    def __init__(self, lock_dir: Optional[str] = None):
+        """
+        Initialize the cross-process lock manager.
+
+        Args:
+            lock_dir: Directory to store lock files. Defaults to /tmp/mediaflow_locks
+        """
+        if lock_dir is None:
+            lock_dir = os.path.join(tempfile.gettempdir(), "mediaflow_locks")
+        self.lock_dir = Path(lock_dir)
+        self._init_lock_dir()
+        self._open_files: dict[str, Any] = {}  # Track open file handles per key
+
+    def _init_lock_dir(self) -> None:
+        """Create lock directory if it doesn't exist."""
+        try:
+            self.lock_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.error(f"Failed to create lock directory {self.lock_dir}: {e}")
+            raise
+
+    def _get_lock_path(self, key: str) -> Path:
+        """Get the lock file path for a given key."""
+        key_hash = hashlib.md5(key.encode()).hexdigest()
+        return self.lock_dir / f"{key_hash}.lock"
+
+    @asynccontextmanager
+    async def acquire(self, key: str, timeout: float = 30.0):
+        """
+        Acquire an exclusive lock for a key.
+
+        This is an async context manager that acquires a file-based lock.
+        The lock is released when the context exits.
+
+        Args:
+            key: The key to lock (typically a URL)
+            timeout: Maximum time to wait for the lock (seconds)
+
+        Yields:
+            None when lock is acquired
+
+        Raises:
+            asyncio.TimeoutError: If lock cannot be acquired within timeout
+        """
+        lock_path = self._get_lock_path(key)
+        lock_file = None
+        acquired = False
+
+        try:
+            # Open the lock file (create if doesn't exist)
+            loop = asyncio.get_event_loop()
+
+            def _open_lock_file():
+                return open(lock_path, "w")
+
+            lock_file = await loop.run_in_executor(None, _open_lock_file)
+
+            # Try to acquire the lock with timeout
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                try:
+                    # Non-blocking lock attempt
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    logger.debug(f"[CrossProcessLock] Acquired lock for: {key[:80]}...")
+                    break
+                except BlockingIOError:
+                    # Lock is held by another process, wait a bit
+                    await asyncio.sleep(0.05)  # 50ms between retries
+
+            if not acquired:
+                raise asyncio.TimeoutError(f"Failed to acquire lock for {key[:80]}... within {timeout}s")
+
+            yield
+
+        finally:
+            if lock_file is not None:
+                try:
+                    if acquired:
+                        # Release the lock
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                        logger.debug(f"[CrossProcessLock] Released lock for: {key[:80]}...")
+                    lock_file.close()
+                except Exception as e:
+                    logger.warning(f"[CrossProcessLock] Error releasing lock: {e}")
+
+    async def cleanup_stale_locks(self, max_age_seconds: int = 300) -> int:
+        """
+        Remove lock files older than max_age_seconds.
+
+        This should be called periodically to clean up orphaned lock files
+        from crashed processes.
+
+        Args:
+            max_age_seconds: Maximum age of lock files to keep
+
+        Returns:
+            Number of lock files removed
+        """
+        removed_count = 0
+        try:
+            current_time = time.time()
+            for lock_file in self.lock_dir.glob("*.lock"):
+                try:
+                    file_age = current_time - lock_file.stat().st_mtime
+                    if file_age > max_age_seconds:
+                        lock_file.unlink(missing_ok=True)
+                        removed_count += 1
+                except FileNotFoundError:
+                    # File was already deleted
+                    pass
+                except Exception as e:
+                    logger.warning(f"[CrossProcessLock] Error removing stale lock {lock_file}: {e}")
+        except Exception as e:
+            logger.error(f"[CrossProcessLock] Error during stale lock cleanup: {e}")
+
+        if removed_count > 0:
+            logger.info(f"[CrossProcessLock] Cleaned up {removed_count} stale lock files")
+
+        return removed_count
+
+
+# Global cross-process lock instance for segment downloads
+SEGMENT_DOWNLOAD_LOCK = CrossProcessLock()
+
+
 # Create cache instances
 INIT_SEGMENT_CACHE = HybridCache(
     cache_dir_name="init_segment_cache",
     ttl=3600,  # 1 hour
     max_memory_size=500 * 1024 * 1024,  # 500MB for init segments
+)
+
+# Cache for processed (DRM-stripped) init segments - memory only for speed
+PROCESSED_INIT_CACHE = AsyncMemoryCache(
+    max_memory_size=100 * 1024 * 1024,  # 100MB for processed init segments
 )
 
 MPD_CACHE = AsyncMemoryCache(
@@ -296,6 +474,14 @@ EXTRACTOR_CACHE = HybridCache(
     max_memory_size=50 * 1024 * 1024,
 )
 
+# Cache for media segments (prebuffer) - file-backed for cross-worker sharing
+# Uses HybridCache so segments cached by one worker are available to all workers
+SEGMENT_CACHE = HybridCache(
+    cache_dir_name="segment_cache",
+    ttl=60,  # Short TTL for live streams (60 seconds)
+    max_memory_size=200 * 1024 * 1024,  # 200MB memory cache per worker
+)
+
 
 # Specific cache implementations
 async def get_cached_init_segment(
@@ -303,6 +489,7 @@ async def get_cached_init_segment(
     headers: dict,
     cache_token: str | None = None,
     ttl: Optional[int] = None,
+    byte_range: str | None = None,
 ) -> Optional[bytes]:
     """Get initialization segment from cache or download it.
 
@@ -310,10 +497,13 @@ async def get_cached_init_segment(
     rely on different DRM keys or initialization payloads (e.g. key rotation).
 
     ttl overrides the default cache TTL; pass a value <= 0 to skip caching entirely.
+
+    byte_range specifies a byte range for SegmentBase MPDs (e.g., '0-11568').
     """
 
     use_cache = ttl is None or ttl > 0
-    cache_key = f"{init_url}|{cache_token}" if cache_token else init_url
+    # Include byte_range in cache key for SegmentBase
+    cache_key = f"{init_url}|{cache_token}|{byte_range}" if cache_token or byte_range else init_url
 
     if use_cache:
         cached_data = await INIT_SEGMENT_CACHE.get(cache_key)
@@ -324,7 +514,12 @@ async def get_cached_init_segment(
         await INIT_SEGMENT_CACHE.delete(cache_key)
 
     try:
-        init_content = await download_file_with_retry(init_url, headers)
+        # Add Range header if byte_range is specified (for SegmentBase MPDs)
+        request_headers = dict(headers)
+        if byte_range:
+            request_headers["Range"] = f"bytes={byte_range}"
+
+        init_content = await download_file_with_retry(init_url, request_headers)
         if init_content and use_cache:
             await INIT_SEGMENT_CACHE.set(cache_key, init_content, ttl=ttl)
         return init_content
@@ -383,4 +578,76 @@ async def set_cache_extractor_result(key: str, result: dict) -> bool:
         return await EXTRACTOR_CACHE.set(key, json.dumps(result).encode())
     except Exception as e:
         logger.error(f"Error caching extractor result: {e}")
+        return False
+
+
+async def get_cached_processed_init(
+    init_url: str,
+    key_id: str,
+) -> Optional[bytes]:
+    """Get processed (DRM-stripped) init segment from cache.
+
+    Args:
+        init_url: URL of the init segment
+        key_id: DRM key ID used for processing
+
+    Returns:
+        Processed init segment bytes if cached, None otherwise
+    """
+    cache_key = f"processed|{init_url}|{key_id}"
+    return await PROCESSED_INIT_CACHE.get(cache_key)
+
+
+async def set_cached_processed_init(
+    init_url: str,
+    key_id: str,
+    processed_content: bytes,
+    ttl: Optional[int] = None,
+) -> bool:
+    """Cache processed (DRM-stripped) init segment.
+
+    Args:
+        init_url: URL of the init segment
+        key_id: DRM key ID used for processing
+        processed_content: The processed init segment bytes
+        ttl: Optional TTL override
+
+    Returns:
+        True if cached successfully
+    """
+    cache_key = f"processed|{init_url}|{key_id}"
+    try:
+        return await PROCESSED_INIT_CACHE.set(cache_key, processed_content, ttl=ttl)
+    except Exception as e:
+        logger.error(f"Error caching processed init segment: {e}")
+        return False
+
+
+async def get_cached_segment(segment_url: str) -> Optional[bytes]:
+    """Get media segment from prebuffer cache.
+
+    Args:
+        segment_url: URL of the segment
+
+    Returns:
+        Segment bytes if cached, None otherwise
+    """
+    return await SEGMENT_CACHE.get(segment_url)
+
+
+async def set_cached_segment(segment_url: str, content: bytes, ttl: int = 60) -> bool:
+    """Cache media segment with configurable TTL.
+
+    Args:
+        segment_url: URL of the segment
+        content: Segment bytes
+        ttl: Time to live in seconds (default 60s, configurable via dash_segment_cache_ttl)
+
+    Returns:
+        True if cached successfully
+    """
+    try:
+        return await SEGMENT_CACHE.set(segment_url, content, ttl=ttl)
+    except Exception as e:
+        logger.error(f"Error caching segment: {e}")
         return False

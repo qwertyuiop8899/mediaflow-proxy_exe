@@ -1,5 +1,4 @@
 import re
-from typing import Dict, Any
 
 from mediaflow_proxy.extractors.base import BaseExtractor, ExtractorError
 
@@ -36,7 +35,7 @@ class TurboVidPlayExtractor(BaseExtractor):
         if media_url.startswith("//"):
             media_url = "https:" + media_url
         elif media_url.startswith("/"):
-            media_url = response.url.origin + media_url
+            media_url = response.get_origin() + media_url
 
         #
         # 3. Fetch the intermediate playlist
@@ -53,16 +52,11 @@ class TurboVidPlayExtractor(BaseExtractor):
 
         real_m3u8 = m2.group(0)
 
-        #
-        # 5. Final headers
-        #
-        self.base_headers["referer"] = url
-
-        #
-        # 6. Always return master proxy (your MediaFlow only supports this)
-        #
         return {
             "destination_url": real_m3u8,
-            "request_headers": self.base_headers,
+            "request_headers": {"origin": response.get_origin()},
+            "propagate_response_headers": {"content-type": "video/mp2t"},
+            "remove_response_headers": ["content-length", "content-range"],
             "mediaflow_endpoint": "hls_manifest_proxy",
+            "stream_transformer": "ts_stream",  # Use TS transformer for PNG/padding stripping
         }

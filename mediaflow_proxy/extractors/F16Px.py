@@ -32,9 +32,6 @@ class F16PxExtractor(BaseExtractor):
         host = parsed.netloc
         origin = f"{parsed.scheme}://{parsed.netloc}"
 
-        if not (host.endswith("f16px.com") or host.endswith("bysesayeveum.com")):
-            raise ExtractorError("F16PX: Invalid domain")
-
         match = re.search(r"/e/([A-Za-z0-9]+)", parsed.path or "")
         if not match:
             raise ExtractorError("F16PX: Invalid embed URL")
@@ -68,9 +65,9 @@ class F16PxExtractor(BaseExtractor):
             raise ExtractorError("F16PX: No playback data")
 
         try:
-            iv = self._b64url_decode(pb["iv"])             # nonce
-            key = self._join_key_parts(pb["key_parts"])    # AES key
-            payload = self._b64url_decode(pb["payload"])   # ciphertext + tag
+            iv = self._b64url_decode(pb["iv"])  # nonce
+            key = self._join_key_parts(pb["key_parts"])  # AES key
+            payload = self._b64url_decode(pb["payload"])  # ciphertext + tag
 
             cipher = python_aesgcm.new(key)
             decrypted = cipher.open(iv, payload)  # AAD = '' like ResolveURL
@@ -98,7 +95,7 @@ class F16PxExtractor(BaseExtractor):
         self.base_headers["origin"] = origin
         self.base_headers["Accept-Language"] = "en-US,en;q=0.5"
         self.base_headers["Accept"] = "*/*"
-        self.base_headers['user-agent'] = 'Mozilla/5.0 (X11; Linux x86_64; rv:138.0) Gecko/20100101 Firefox/138.0'
+        self.base_headers["user-agent"] = "Mozilla/5.0 (X11; Linux x86_64; rv:138.0) Gecko/20100101 Firefox/138.0"
 
         return {
             "destination_url": best,
